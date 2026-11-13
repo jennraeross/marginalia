@@ -1,0 +1,22 @@
+[package]
+name = "marginalia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.37"
+egui = "0.37"
+egui_extras = "0.37"
+rusqlite = { version = "0.42", features = ["bundled"] }
+epub = "2.1"
+sha2 = "0.11"
+hex = "0.4"
+directories = "6.0"
+rfd = "0.18"
+scraper = "0.29"
+html-escape = "0.2"
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
+tempfile = "3"
+zip = "2"
