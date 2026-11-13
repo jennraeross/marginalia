@@ -2,6 +2,7 @@ use crate::epub_utils::{self, Block, Chapter, TocEntry};
 use crate::fanficfare;
 use crate::fonts;
 use crate::library::{AddOutcome, Book, Library, SortKey};
+use crate::speech::{blocks_to_speech, SpeechEngine};
 use crate::themes::ThemeId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -170,6 +171,9 @@ pub struct MarginaliaApp {
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
     jobs: JobState,
+    speech: SpeechEngine,
+    reading_aloud: bool,
+    speak_pending: bool,
     show_download: bool,
     download_url: String,
     show_display: bool,
@@ -243,6 +247,9 @@ impl MarginaliaApp {
                 busy: false,
                 log: VecDeque::new(),
             },
+            speech: SpeechEngine::new(),
+            reading_aloud: false,
+            speak_pending: false,
             show_download: false,
             download_url: String::new(),
             show_display: false,
@@ -359,6 +366,7 @@ impl MarginaliaApp {
     }
 
     fn open_reader(&mut self, id: i64) {
+        self.stop_reading();
         let _ = self.lib.touch_opened(id);
         self.load_reader_chapters(id);
         self.view = View::Reader;
@@ -392,6 +400,7 @@ impl MarginaliaApp {
     }
 
     fn close_reader(&mut self) {
+        self.stop_reading();
         if let Some(b) = &self.reader_book {
             let _ = self
                 .lib
@@ -426,6 +435,65 @@ impl MarginaliaApp {
                 .lib
                 .save_progress(b.id, self.current as i64, self.page as i64);
         }
+    }
+
+    /// Pages are built for the open chapter: check the paginated layout
+    /// actually matches it (false right after a chapter spill, until the
+    /// next frame rebuilds).
+    fn pages_built_for_current(&self) -> bool {
+        match (&self.reader_book, &self.pages_key) {
+            (Some(b), Some(k)) => k.book == b.id && k.chapter == self.current,
+            _ => false,
+        }
+    }
+
+    /// Speak the current page aloud (text only; images are skipped).
+    fn speak_current_page(&mut self) {
+        let Some(pg) = self.pages.get(self.page).cloned() else {
+            return;
+        };
+        let end = pg.end.min(self.flow.len());
+        let start = pg.start.min(end);
+        self.speech
+            .speak(blocks_to_speech("", &self.flow[start..end]));
+    }
+
+    /// Start reading the current page aloud, deferring until pages exist.
+    fn start_reading(&mut self) {
+        if let Some(e) = self.speech.take_error() {
+            self.error = Some(e);
+            return;
+        }
+        self.reading_aloud = true;
+        if self.pages_built_for_current() {
+            self.speak_current_page();
+        } else {
+            self.speak_pending = true;
+        }
+    }
+
+    /// Stop read-aloud and invalidate any in-flight finish events.
+    fn stop_reading(&mut self) {
+        self.reading_aloud = false;
+        self.speak_pending = false;
+        self.speech.stop();
+    }
+
+    /// User-initiated navigation stops read-aloud first (auto-advance calls
+    /// the plain variants directly so the book can read itself).
+    fn user_next_page(&mut self) {
+        self.stop_reading();
+        self.next_page();
+    }
+
+    fn user_prev_page(&mut self) {
+        self.stop_reading();
+        self.prev_page();
+    }
+
+    fn user_goto_chapter(&mut self, idx: usize) {
+        self.stop_reading();
+        self.goto_chapter(idx);
     }
 
     /// Page turn forward. Spills into the next chapter, like clibrary.
@@ -791,7 +859,7 @@ impl eframe::App for MarginaliaApp {
                 ui.label("Download: fetch a fic URL via fanficfare.");
                 ui.label("Update: refresh selected tracked fic (keeps position).");
                 ui.label("Update all: refresh every tracked fic.");
-                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents; the bottom bar keeps Prev and TOC on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
+                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev and TOC on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
                 if ui.button("Close").clicked() {
                     self.show_help = false;
                 }
@@ -812,6 +880,25 @@ impl eframe::App for MarginaliaApp {
         match self.view {
             View::Library => self.ui_library(ui),
             View::Reader => self.ui_reader(ui),
+        }
+        // Read-aloud follow: when the spoken page ends, turn the page and
+        // keep reading; stop (rather than loop) at the end of the book. Any
+        // backend failure surfaces once as a Notice and stops playback.
+        if let Some(e) = self.speech.take_error() {
+            self.error = Some(e);
+            self.stop_reading();
+        }
+        if self.reading_aloud && self.view == View::Reader && self.speech.poll_finished() {
+            let before = (self.current, self.page);
+            self.next_page();
+            if (self.current, self.page) == before {
+                self.stop_reading();
+            } else if self.pages_built_for_current() {
+                self.speak_current_page();
+            } else {
+                // Chapter spill: pages rebuild next frame; speak then.
+                self.speak_pending = true;
+            }
         }
         self.flush_display_settings();
         if self.jobs.busy {
@@ -1625,12 +1712,19 @@ impl MarginaliaApp {
                     }
                 }
                 match turn {
-                    Some(1) => self.next_page(),
-                    Some(-1) => self.prev_page(),
+                    Some(1) => self.user_next_page(),
+                    Some(-1) => self.user_prev_page(),
                     _ => {}
                 }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
                     self.toc_open = !self.toc_open;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::R) {
+                    if self.reading_aloud {
+                        self.stop_reading();
+                    } else {
+                        self.start_reading();
+                    }
                 }
             });
         }
@@ -1665,7 +1759,7 @@ impl MarginaliaApp {
                             ui.disable();
                         }
                         if ui.button("‹ Prev").clicked() {
-                            self.prev_page();
+                            self.user_prev_page();
                         }
                         if ui
                             .button(if self.toc_open { "TOC v" } else { "TOC >" })
@@ -1679,8 +1773,19 @@ impl MarginaliaApp {
                             if faded {
                                 ui.disable();
                             }
+                            if ui
+                                .button(if self.reading_aloud { "Stop" } else { "Read" })
+                                .on_hover_text("read aloud (R)")
+                                .clicked()
+                            {
+                                if self.reading_aloud {
+                                    self.stop_reading();
+                                } else {
+                                    self.start_reading();
+                                }
+                            }
                             if ui.button("Next ›").clicked() {
-                                self.next_page();
+                                self.user_next_page();
                             }
                         });
                         // The status line ignores the fade and stays visible.
@@ -1704,7 +1809,7 @@ impl MarginaliaApp {
                             let is_cur = t.chapter == Some(self.current);
                             if ui.selectable_label(is_cur, label).clicked() {
                                 if let Some(c) = t.chapter {
-                                    self.goto_chapter(c);
+                                    self.user_goto_chapter(c);
                                 }
                             }
                         }
@@ -1765,6 +1870,13 @@ impl MarginaliaApp {
                     self.flow = flow;
                     self.pages = pages;
                     self.pages_key = Some(key);
+                }
+            }
+            // Deferred read-aloud start (chapter spill or pre-build Read).
+            if self.speak_pending && self.pages_built_for_current() {
+                self.speak_pending = false;
+                if self.reading_aloud {
+                    self.speak_current_page();
                 }
             }
             // (Compare geometry, not `key`: it was moved above. Equal
@@ -2018,6 +2130,9 @@ mod tests {
                 busy: false,
                 log: VecDeque::new(),
             },
+            speech: SpeechEngine::new(),
+            reading_aloud: false,
+            speak_pending: false,
             show_download: false,
             download_url: String::new(),
             show_display: false,
