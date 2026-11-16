@@ -309,6 +309,7 @@ impl MarginaliaApp {
         cc.egui_ctx.set_visuals(app.theme.visuals());
         app.refresh();
         app.maybe_backfill_fanfic_urls();
+        app.start_silent_update_check();
         app
     }
 
@@ -1107,6 +1108,10 @@ impl MarginaliaApp {
                                 nb.id,
                                 fanficfare::CheckState::UpToDate,
                             )]));
+                            let remote =
+                                crate::epub_utils::chapter_count(&lib.abs_path(&nb.file_path))
+                                    .map(|n| n.max(1));
+                            let _ = lib.record_check(nb.id, remote);
                             let _ = tx.send(JobEvent::Done(format!("updated {}", nb.title)));
                         }
                         Err(e) => {
@@ -1121,26 +1126,94 @@ impl MarginaliaApp {
         });
     }
 
-    /// Metadata-only update check over tracked books (session-only results).
-    /// Compares remote chapter counts against local EPUBs without downloading.
+    /// Freshness window for cached update checks: books checked within this
+    /// window reuse the cached remote count without network traffic.
+    const CHECK_TTL_SECS: i64 = 12 * 3600;
+
+    /// Metadata-only update check over tracked books (session-only results,
+    /// backed by a persistent check cache).
+    /// AO3 books use a fast native work-page fetch; everything else (and AO3
+    /// fallbacks) use FanFicFare. Books with a fresh cached check skip the
+    /// network; every attempted fetch is cached for next time.
     fn start_check_updates(&mut self) {
-        if !fanficfare::is_available() {
-            self.error = Some("fanficfare not found on PATH.".into());
-            return;
-        }
         let tracked = self.lib.tracked().unwrap_or_default();
         if tracked.is_empty() {
-            self.error = Some("no FanFicFare-tracked books.".into());
+            self.error = Some("no tracked fics.".into());
             return;
         }
         self.jobs.busy = true;
         self.jobs.push(format!("checking {} fics …", tracked.len()));
-        let tx = self.tx.clone();
-        let root = self.lib.root.clone();
-        let items: Vec<(i64, String, String)> = tracked
-            .into_iter()
-            .map(|b| (b.id, b.title, b.fanfic_url.unwrap_or_default()))
-            .collect();
+        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), false);
+    }
+
+    /// Quiet background pass at startup: hydrates markers from cache and
+    /// checks stale AO3 books natively. Never touches FanFicFare (slow) and
+    /// never takes the busy indicator.
+    fn start_silent_update_check(&mut self) {
+        if self.tracked_count == 0 {
+            return;
+        }
+        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), true);
+    }
+
+    /// One attempted remote chapter count: `Some(r)` (cache it; `r` is `None`
+    /// when the remote count is definitively unknown) or `None` (nothing
+    /// tried or transport failure: do not cache). Silent mode never runs
+    /// FanFicFare and stays quiet.
+    fn fetch_remote_chapters(
+        tx: &mpsc::Sender<JobEvent>,
+        title: &str,
+        url: &str,
+        silent: bool,
+        ao3_armed: &mut bool,
+    ) -> Option<Option<usize>> {
+        if let Some(work_id) = crate::ao3::work_id_from_url(url) {
+            if *ao3_armed {
+                std::thread::sleep(crate::ao3::POLITENESS_DELAY);
+            }
+            *ao3_armed = true;
+            match crate::ao3::fetch_chapter_count(work_id, crate::ao3::FETCH_TIMEOUT) {
+                Ok(count) => return Some(count),
+                Err(e) => {
+                    if silent {
+                        return None;
+                    }
+                    let _ = tx.send(JobEvent::Message(format!(
+                        "check {title}: {e}, trying fanficfare …"
+                    )));
+                }
+            }
+        } else if silent {
+            // Silent pass stays off the network for non-AO3 books.
+            return None;
+        }
+        if !fanficfare::is_available() {
+            if !silent {
+                let _ = tx.send(JobEvent::Message(format!(
+                    "check {title}: fanficfare not found on PATH"
+                )));
+            }
+            return None;
+        }
+        match fanficfare::fetch_meta(url, std::time::Duration::from_secs(45)) {
+            Ok(meta) => Some(meta.chapters),
+            Err(e) => {
+                if !silent {
+                    let first = e
+                        .lines()
+                        .next()
+                        .unwrap_or(&e)
+                        .chars()
+                        .take(160)
+                        .collect::<String>();
+                    let _ = tx.send(JobEvent::Message(format!("check {title} failed: {first}")));
+                }
+                None
+            }
+        }
+    }
+
+    fn spawn_update_check(tx: mpsc::Sender<JobEvent>, root: std::path::PathBuf, silent: bool) {
         std::thread::spawn(move || {
             let lib = match Library::open(root) {
                 Ok(l) => l,
@@ -1149,10 +1222,28 @@ impl MarginaliaApp {
                     return;
                 }
             };
+            let items: Vec<(i64, String, String)> = lib
+                .tracked()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| (b.id, b.title, b.fanfic_url.unwrap_or_default()))
+                .collect();
+            if items.is_empty() {
+                return;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let mut results = Vec::new();
             let mut avail = 0;
+            let mut cached = 0;
+            let mut fetched = 0;
+            let mut ao3_armed = false;
             for (id, title, url) in &items {
-                let _ = tx.send(JobEvent::Message(format!("checking {title} …")));
+                if !silent {
+                    let _ = tx.send(JobEvent::Message(format!("checking {title} …")));
+                }
                 let local = lib
                     .get_by_id(*id)
                     .ok()
@@ -1160,40 +1251,61 @@ impl MarginaliaApp {
                     .map(|b| {
                         crate::epub_utils::chapter_count(&lib.abs_path(&b.file_path))
                             .unwrap_or(1)
-                            .max(1) as usize
+                            .max(1)
                     })
                     .unwrap_or(0);
-                match fanficfare::fetch_meta(url, std::time::Duration::from_secs(45)) {
-                    Ok(meta) => match fanficfare::compare_chapters(local, meta.chapters) {
-                        Some(state @ fanficfare::CheckState::UpdateAvailable { .. }) => {
-                            avail += 1;
-                            results.push((*id, state));
+                // Fresh cache wins: no network.
+                let mut remote: Option<Option<usize>> = None;
+                if let Ok(Some((at, rem))) = lib.get_check(*id) {
+                    if now - at < Self::CHECK_TTL_SECS {
+                        remote = Some(rem);
+                        cached += 1;
+                    }
+                }
+                let remote = match remote {
+                    Some(r) => r,
+                    None => {
+                        match Self::fetch_remote_chapters(&tx, title, url, silent, &mut ao3_armed) {
+                            Some(r) => {
+                                // Attempted: cache for next time (ignore cache errors).
+                                let _ = lib.record_check(*id, r);
+                                fetched += 1;
+                                r
+                            }
+                            // Skipped or failed: never cache a non-attempt.
+                            None => continue,
                         }
-                        Some(state) => results.push((*id, state)),
-                        None => {
+                    }
+                };
+                match fanficfare::compare_chapters(local, remote) {
+                    Some(state @ fanficfare::CheckState::UpdateAvailable { .. }) => {
+                        avail += 1;
+                        results.push((*id, state));
+                    }
+                    Some(state) => results.push((*id, state)),
+                    None => {
+                        if !silent {
                             let _ = tx.send(JobEvent::Message(format!(
                                 "check {title}: no chapter count"
                             )));
                         }
-                    },
-                    Err(e) => {
-                        let first = e
-                            .lines()
-                            .next()
-                            .unwrap_or(&e)
-                            .chars()
-                            .take(160)
-                            .collect::<String>();
-                        let _ =
-                            tx.send(JobEvent::Message(format!("check {title} failed: {first}")));
                     }
                 }
             }
             let _ = tx.send(JobEvent::CheckDone(results));
-            let _ = tx.send(JobEvent::Done(format!(
-                "check complete: {avail} update{} available",
-                if avail == 1 { "" } else { "s" }
-            )));
+            if silent {
+                if avail > 0 {
+                    let _ = tx.send(JobEvent::Message(format!(
+                        "⇪ {avail} fic{} with updates (auto-check)",
+                        if avail == 1 { "" } else { "s" }
+                    )));
+                }
+            } else {
+                let _ = tx.send(JobEvent::Done(format!(
+                    "check complete: {avail} update{} available ({fetched} fetched, {cached} cached)",
+                    if avail == 1 { "" } else { "s" }
+                )));
+            }
         });
     }
 
@@ -1267,9 +1379,14 @@ impl MarginaliaApp {
                 }
                 match fanficfare::update_epub_file(&tmp_epub) {
                     Ok(_) => match lib.replace_file(id, &tmp_epub) {
-                        Ok(_) => {
+                        Ok(nb) => {
                             ok += 1;
                             fresh.push((id, fanficfare::CheckState::UpToDate));
+                            // Freshly imported: cache the new local count as remote.
+                            let remote =
+                                crate::epub_utils::chapter_count(&lib.abs_path(&nb.file_path))
+                                    .map(|n| n.max(1));
+                            let _ = lib.record_check(id, remote);
                             let _ = tx.send(JobEvent::ReaderReload(id));
                         }
                         Err(_) => fail += 1,

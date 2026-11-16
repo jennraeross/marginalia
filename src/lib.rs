@@ -1,3 +1,4 @@
+pub mod ao3;
 pub mod app;
 pub mod epub_utils;
 pub mod fanficfare;

@@ -4,10 +4,47 @@ use std::io::Write;
 use std::path::Path;
 
 fn make_epub(path: &Path, title: &str, author: &str) {
-    make_epub_n(path, title, author, 1);
+    make_epub_full(
+        path,
+        title,
+        author,
+        1,
+        Some("http://example.com/fic/123"),
+        "",
+    );
 }
 
 fn make_epub_n(path: &Path, title: &str, author: &str, paras: usize) {
+    make_epub_full(
+        path,
+        title,
+        author,
+        paras,
+        Some("http://example.com/fic/123"),
+        "",
+    );
+}
+
+/// Direct-AO3-style download: no URL identifier, work link in the preface.
+fn make_epub_ao3(path: &Path, title: &str, author: &str, work_id: u32) {
+    make_epub_full(
+        path,
+        title,
+        author,
+        1,
+        None,
+        &format!("Posted originally on the Archive of Our Own at http://archiveofourown.org/works/{work_id}."),
+    );
+}
+
+fn make_epub_full(
+    path: &Path,
+    title: &str,
+    author: &str,
+    paras: usize,
+    identifier: Option<&str>,
+    preface: &str,
+) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default();
@@ -22,13 +59,19 @@ fn make_epub_n(path: &Path, title: &str, author: &str, paras: usize) {
         br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
     )
     .unwrap();
+    let ident = identifier
+        .map(|id| format!("<dc:identifier>{id}</dc:identifier>"))
+        .unwrap_or_default();
     let opf = format!(
-        r#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator><dc:language>en</dc:language><dc:identifier>http://example.com/fic/123</dc:identifier></metadata><manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="ch1"/></spine></package>"#
+        r#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator><dc:language>en</dc:language>{ident}</metadata><manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="ch1"/></spine></package>"#
     );
     zip.start_file("OEBPS/content.opf", opts).unwrap();
     zip.write_all(opf.as_bytes()).unwrap();
     zip.start_file("OEBPS/ch1.xhtml", opts).unwrap();
     let mut body = format!("<h1>{title}</h1><p>Hello from {author}.</p>");
+    if !preface.is_empty() {
+        body = format!("<p>{preface}</p>{body}");
+    }
     for i in 0..paras {
         body.push_str(&format!(
             "<p>Filler paragraph {i} with some words to grow the file.</p>"
@@ -376,4 +419,61 @@ fn inline_images_load_with_dims() {
         })
         .collect();
     assert_eq!(alts, vec!["A pic", "Fallback"]);
+}
+
+#[test]
+fn ao3_preface_link_becomes_tracked() {
+    let libdir = tempfile::tempdir().unwrap();
+    let lib = Library::open(libdir.path().join("lib")).expect("open lib");
+
+    let srcdir = tempfile::tempdir().unwrap();
+    let epub = srcdir.path().join("ao3.epub");
+    make_epub_ao3(&epub, "AO3 Story", "Some Author", 98765);
+
+    // No URL identifier in the file, but the preface link is picked up and
+    // canonicalized to https.
+    let outcome = lib.add_file(&epub).expect("add");
+    let book = match outcome {
+        marginalia::library::AddOutcome::Added(b) => b,
+        marginalia::library::AddOutcome::Duplicate(b) => b,
+    };
+    assert_eq!(
+        book.fanfic_url.as_deref(),
+        Some("https://archiveofourown.org/works/98765")
+    );
+    assert_eq!(lib.tracked().unwrap().len(), 1);
+}
+
+#[test]
+fn backfill_links_untracked_books() {
+    let libdir = tempfile::tempdir().unwrap();
+    let lib = Library::open(libdir.path().join("lib")).expect("open lib");
+
+    let srcdir = tempfile::tempdir().unwrap();
+    // Untracked at import: preface scan runs at import too, so simulate a
+    // legacy row by clearing the URL afterwards.
+    let epub = srcdir.path().join("legacy.epub");
+    make_epub_ao3(&epub, "Legacy Story", "Old Author", 11223);
+    let outcome = lib.add_file(&epub).expect("add");
+    let book = match outcome {
+        marginalia::library::AddOutcome::Added(b) => b,
+        marginalia::library::AddOutcome::Duplicate(b) => b,
+    };
+    let conn = rusqlite::Connection::open(libdir.path().join("lib/index.db")).unwrap();
+    conn.execute("UPDATE books SET fanfic_url = '' WHERE id = ?1", [book.id])
+        .unwrap();
+    drop(conn);
+    assert!(lib.tracked().unwrap().is_empty());
+
+    let filled = lib.backfill_fanfic_urls().expect("backfill");
+    assert_eq!(filled, vec![book.id]);
+    let tracked = lib.tracked().unwrap();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(
+        tracked[0].fanfic_url.as_deref(),
+        Some("https://archiveofourown.org/works/11223")
+    );
+
+    // Second pass finds nothing new.
+    assert!(lib.backfill_fanfic_urls().expect("backfill").is_empty());
 }

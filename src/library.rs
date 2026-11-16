@@ -171,6 +171,13 @@ impl Library {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            -- Cached remote chapter counts from update checks, so repeat
+            -- checks only hit the network for stale books.
+            CREATE TABLE IF NOT EXISTS update_checks (
+                book_id INTEGER PRIMARY KEY,
+                checked_at INTEGER NOT NULL,
+                remote_chapters INTEGER
             );",
         )?;
         // Migration for libraries created before page-level progress existed.
@@ -407,6 +414,74 @@ impl Library {
         Ok(out)
     }
 
+    /// Record an update check: now plus the remote chapter count (`None`
+    /// when the remote count is unknown). Fresh entries let repeat checks
+    /// skip the network.
+    pub fn record_check(&self, book_id: i64, remote_chapters: Option<usize>) -> AnyhowResult {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO update_checks(book_id, checked_at, remote_chapters)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(book_id) DO UPDATE SET checked_at=?2, remote_chapters=?3",
+            params![
+                book_id,
+                Utc::now().timestamp(),
+                remote_chapters.map(|n| n as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Cached check for one book: `(checked_at_unix, remote_chapters)`.
+    pub fn get_check(&self, book_id: i64) -> AnyhowResult<Option<(i64, Option<usize>)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare("SELECT checked_at, remote_chapters FROM update_checks WHERE book_id = ?1")?;
+        let mut rows = stmt.query_map(params![book_id], |row| {
+            let at: i64 = row.get(0)?;
+            let remote: Option<i64> = row.get(1)?;
+            Ok((at, remote.map(|n| n.max(0) as usize)))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fill missing fic URLs by scanning AO3 prefaces (direct AO3 downloads
+    /// carry no URL identifier). Returns the ids that gained a URL.
+    pub fn backfill_fanfic_urls(&self) -> AnyhowResult<Vec<i64>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path FROM books WHERE fanfic_url IS NULL OR fanfic_url = ''",
+        )?;
+        let pending: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        drop(conn);
+        let mut filled = Vec::new();
+        for (id, rel) in pending {
+            let url = parse_epub_meta(&self.abs_path(&rel))
+                .ok()
+                .and_then(|m| m.fanfic_url);
+            if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
+                let conn = self.connect()?;
+                if conn
+                    .execute(
+                        "UPDATE books SET fanfic_url = ?1 WHERE id = ?2",
+                        params![url, id],
+                    )
+                    .is_ok()
+                {
+                    filled.push(id);
+                }
+            }
+        }
+        Ok(filled)
+    }
+
     pub fn touch_opened(&self, id: i64) -> AnyhowResult {
         let conn = self.connect()?;
         conn.execute(
@@ -628,8 +703,55 @@ pub struct EpubMeta {
     pub fanfic_url: Option<String>,
 }
 
+/// Find an AO3 work URL in chapter HTML (AO3's auto-generated preface links
+/// the work). Returns the canonical `https://archiveofourown.org/works/NNN`.
+fn scan_ao3_url(html: &str) -> Option<String> {
+    const NEEDLE: &str = "archiveofourown.org/works/";
+    // Byte-wise walk: all cut points sit on the ASCII needle, so slicing is
+    // always on char boundaries.
+    let mut rest = html;
+    let mut offset = 0;
+    while let Some(pos) = rest.find(NEEDLE) {
+        let abs = offset + pos;
+        if !html[..abs].ends_with("https://") && !html[..abs].ends_with("http://") {
+            // Bare domain text, not a link; keep looking.
+            rest = &rest[pos + NEEDLE.len()..];
+            offset = abs + NEEDLE.len();
+            continue;
+        }
+        let digits: String = rest[pos + NEEDLE.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            return Some(format!("https://archiveofourown.org/works/{digits}"));
+        }
+        rest = &rest[pos + NEEDLE.len()..];
+        offset = abs + NEEDLE.len();
+    }
+    None
+}
+
+/// Scan the opening chapters for an AO3 preface link. Limited to two
+/// chapters: the link lives up front, and later chapters only add cost.
+pub(crate) fn find_ao3_url<R: std::io::Read + std::io::Seek>(
+    doc: &mut EpubDoc<R>,
+) -> Option<String> {
+    let n = doc.get_num_chapters();
+    for i in 0..n.min(2) {
+        if !doc.set_current_chapter(i) {
+            continue;
+        }
+        let (html, _) = doc.get_current_str().unwrap_or_default();
+        if let Some(url) = scan_ao3_url(&html) {
+            return Some(url);
+        }
+    }
+    None
+}
+
 pub fn parse_epub_meta(path: &Path) -> AnyhowResult<EpubMeta> {
-    let doc = EpubDoc::new(path).map_err(|e| format!("invalid epub: {e}"))?;
+    let mut doc = EpubDoc::new(path).map_err(|e| format!("invalid epub: {e}"))?;
     let mget = |names: &[&str]| -> Vec<String> {
         doc.metadata
             .iter()
@@ -674,6 +796,10 @@ pub fn parse_epub_meta(path: &Path) -> AnyhowResult<EpubMeta> {
         .cloned();
     let raw_desc = one(&["description"]);
     let description = crate::epub_utils::strip_html(&raw_desc);
+    // AO3's auto-generated preface links the work itself; direct AO3
+    // downloads carry no URL identifier, so fall back to that. Runs after
+    // the last metadata-closure use so the chapter scan can borrow mutably.
+    let fanfic_url = fanfic_url.or_else(|| find_ao3_url(&mut doc));
 
     Ok(EpubMeta {
         title,
@@ -727,5 +853,46 @@ mod tests {
         // New sortable columns exist for the details view.
         assert!(SortKey::all().iter().any(|(_, k)| *k == SortKey::Size));
         assert!(SortKey::all().iter().any(|(_, k)| *k == SortKey::Progress));
+    }
+
+    #[test]
+    fn ao3_preface_url_scan() {
+        // Canonical preface line, both schemes.
+        assert_eq!(
+            scan_ao3_url("<p>Posted originally on the Archive of Our Own at http://archiveofourown.org/works/12345.</p>"),
+            Some("https://archiveofourown.org/works/12345".to_string())
+        );
+        assert_eq!(
+            scan_ao3_url("see https://archiveofourown.org/works/67890?view_adult=true#main"),
+            Some("https://archiveofourown.org/works/67890".to_string())
+        );
+        // First match wins; bare domain text without a scheme is skipped.
+        assert_eq!(
+            scan_ao3_url("archiveofourown.org/works/111 then http://archiveofourown.org/works/222"),
+            Some("https://archiveofourown.org/works/222".to_string())
+        );
+        // No digits, non-AO3 links, and plain text give nothing.
+        assert_eq!(scan_ao3_url("<p>No link here.</p>"), None);
+        assert_eq!(scan_ao3_url("http://example.com/works/123"), None);
+        assert_eq!(scan_ao3_url("http://archiveofourown.org/works/"), None);
+    }
+
+    #[test]
+    fn update_check_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path().join("lib")).unwrap();
+        // Miss on a fresh library.
+        assert_eq!(lib.get_check(42).unwrap(), None);
+        // Store and read back a count.
+        lib.record_check(42, Some(12)).unwrap();
+        let (at, remote) = lib.get_check(42).unwrap().unwrap();
+        assert!(at > 0);
+        assert_eq!(remote, Some(12));
+        // Overwrite with unknown.
+        lib.record_check(42, None).unwrap();
+        let (_, remote) = lib.get_check(42).unwrap().unwrap();
+        assert_eq!(remote, None);
+        // Other books are independent.
+        assert_eq!(lib.get_check(43).unwrap(), None);
     }
 }
