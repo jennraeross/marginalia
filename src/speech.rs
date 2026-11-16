@@ -7,7 +7,7 @@
 //! identical to the `piper-neural` branch so the two can be compared fairly
 //! and the winner merged easily.
 
-use crate::epub_utils::Block;
+use crate::epub_utils::{block_plain, Block};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -20,14 +20,8 @@ pub fn blocks_to_speech(label: &str, blocks: &[Block]) -> String {
         parts.push(label.trim().to_string());
     }
     for b in blocks {
-        let s = match b {
-            Block::Heading(_, t)
-            | Block::Paragraph(t)
-            | Block::Quote(t)
-            | Block::ListItem(t)
-            | Block::Pre(t) => t.trim(),
-            Block::Image { .. } => "",
-        };
+        let s = block_plain(b);
+        let s = s.trim();
         if !s.is_empty() {
             parts.push(s.to_string());
         }
@@ -178,13 +172,14 @@ impl SpeechEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epub_utils::plain_spans;
 
     fn speech_blocks() -> Vec<Block> {
         vec![
-            Block::Heading(1, "Chapter One".to_string()),
-            Block::Paragraph("Hello world.".to_string()),
-            Block::Quote("quoted words".to_string()),
-            Block::ListItem("first item".to_string()),
+            Block::Heading(1, plain_spans("Chapter One")),
+            Block::Paragraph(plain_spans("Hello world.")),
+            Block::Quote(plain_spans("quoted words")),
+            Block::ListItem(plain_spans("first item")),
             Block::Image {
                 bytes: vec![],
                 alt: "A pic".to_string(),
@@ -208,7 +203,10 @@ mod tests {
     #[test]
     fn empty_blocks_give_empty_text() {
         assert_eq!(blocks_to_speech("", &[]), "");
-        assert_eq!(blocks_to_speech("  ", &[Block::Paragraph("  ".into())]), "");
+        assert_eq!(
+            blocks_to_speech("  ", &[Block::Paragraph(plain_spans("  "))]),
+            ""
+        );
     }
 
     #[test]

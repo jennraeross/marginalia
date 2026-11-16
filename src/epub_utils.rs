@@ -2,12 +2,54 @@ use epub::doc::{EpubDoc, NavPoint};
 use scraper::{Html, Selector};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Span {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub underline: bool,
+    pub mono: bool,
+}
+
+impl Span {
+    pub fn plain<S: Into<String>>(text: S) -> Self {
+        Self {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// One plain run, unless empty.
+pub fn plain_spans(s: &str) -> Vec<Span> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::plain(s.to_string())]
+    }
+}
+
+/// Concatenated text of spans (layout/clipboard/speech order).
+pub fn spans_plain(spans: &[Span]) -> String {
+    let mut out = String::new();
+    for s in spans {
+        out.push_str(&s.text);
+    }
+    out
+}
+
+/// Total characters across spans (pagination heuristics use this).
+pub fn spans_len(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.text.chars().count()).sum()
+}
+
 #[derive(Debug, Clone)]
 pub enum Block {
-    Heading(u8, String),
-    Paragraph(String),
-    Quote(String),
-    ListItem(String),
+    Heading(u8, Vec<Span>),
+    Paragraph(Vec<Span>),
+    Quote(Vec<Span>),
+    ListItem(Vec<Span>),
     Pre(String),
     /// An inline illustration extracted from the EPUB. `hash` identifies the
     /// bytes for the GPU texture cache; `w`/`h` are the native dimensions in
@@ -65,10 +107,10 @@ pub fn load_book(path: &Path) -> Result<(Vec<TocEntry>, Vec<Chapter>), String> {
         // Fallback: headings as TOC.
         for (i, ch) in chapters.iter().enumerate() {
             for b in &ch.blocks {
-                if let Block::Heading(_, t) = b {
+                if let Block::Heading(_, spans) = b {
                     toc.push(TocEntry {
                         depth: 0,
-                        label: t.clone(),
+                        label: spans_plain(spans),
                         chapter: Some(i),
                     });
                     break;
@@ -101,7 +143,9 @@ pub fn load_book(path: &Path) -> Result<(Vec<TocEntry>, Vec<Chapter>), String> {
             continue;
         }
         let first_title = match ch.blocks.first() {
-            Some(Block::Heading(_, t)) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            Some(Block::Heading(_, spans)) if !spans_plain(spans).trim().is_empty() => {
+                Some(spans_plain(spans).trim().to_string())
+            }
             _ => None,
         };
         if let Some(title) = first_title {
@@ -163,12 +207,15 @@ pub fn strip_html(html: &str) -> String {
     unescaped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn text_of(el: scraper::ElementRef) -> String {
-    let t = el.text().collect::<Vec<_>>().join(" ");
-    html_escape::decode_html_entities(&t)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+pub fn block_plain(b: &Block) -> String {
+    match b {
+        Block::Heading(_, s) | Block::Paragraph(s) | Block::Quote(s) | Block::ListItem(s) => {
+            spans_plain(s)
+        }
+        Block::Pre(t) => t.clone(),
+        // Images carry no text (their alt text renders separately, if at all).
+        Block::Image { .. } => String::new(),
+    }
 }
 
 /// Parse chapter HTML into blocks. `lookup` resolves an `<img src>` value to
@@ -193,20 +240,8 @@ where
     // Merge consecutive whitespace-only away; image blocks always survive.
     blocks
         .into_iter()
-        .filter(|b| matches!(b, Block::Image { .. }) || !block_text(b).is_empty())
+        .filter(|b| matches!(b, Block::Image { .. }) || !block_plain(b).trim().is_empty())
         .collect()
-}
-
-fn block_text(b: &Block) -> &str {
-    match b {
-        Block::Heading(_, t)
-        | Block::Paragraph(t)
-        | Block::Quote(t)
-        | Block::ListItem(t)
-        | Block::Pre(t) => t,
-        // Images carry no text (their alt text renders separately, if at all).
-        Block::Image { .. } => "",
-    }
 }
 
 /// Inline (non-block) elements: their text flows into the surrounding paragraph.
@@ -222,10 +257,12 @@ fn is_inline(tag: &str) -> bool {
             | "cite"
             | "code"
             | "data"
+            | "del"
             | "dfn"
             | "em"
             | "font"
             | "i"
+            | "ins"
             | "kbd"
             | "mark"
             | "nobr"
@@ -255,19 +292,104 @@ fn squash_newlines(t: &str) -> String {
         .collect()
 }
 
-/// Text of an element for inline contexts: descendant text with `<br>` kept as
-/// newlines so explicit line breaks survive (source newlines are just HTML
-/// formatting noise and are collapsed to spaces).
-fn inline_text(el: scraper::ElementRef) -> String {
+/// Accumulated inline style while walking descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Style {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    underline: bool,
+    mono: bool,
+}
+
+fn apply_tag(tag: &str, mut s: Style) -> Style {
+    match tag {
+        "b" | "strong" => s.bold = true,
+        "i" | "em" | "cite" | "dfn" | "var" => s.italic = true,
+        "s" | "strike" | "del" => s.strike = true,
+        "u" | "ins" | "a" => s.underline = true,
+        "code" | "kbd" | "tt" | "samp" => s.mono = true,
+        _ => {}
+    }
+    s
+}
+
+fn style_of_span(s: &Span) -> Style {
+    Style {
+        bold: s.bold,
+        italic: s.italic,
+        strike: s.strike,
+        underline: s.underline,
+        mono: s.mono,
+    }
+}
+
+fn push_span(out: &mut Vec<Span>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    let decoded = html_escape::decode_html_entities(&text).into_owned();
+    if decoded.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut() {
+        if style_of_span(last) == style {
+            last.text.push_str(&decoded);
+            return;
+        }
+    }
+    out.push(Span {
+        text: decoded,
+        bold: style.bold,
+        italic: style.italic,
+        strike: style.strike,
+        underline: style.underline,
+        mono: style.mono,
+    });
+}
+
+/// Recurse into `el`, applying its own tag on top of `base`.
+fn collect_element_spans(el: scraper::ElementRef, base: Style, out: &mut Vec<Span>) {
     use scraper::node::Node;
-    let mut out = String::new();
+    let style = apply_tag(el.value().name(), base);
     for child in el.children() {
         match child.value() {
-            Node::Text(t) => out.push_str(&squash_newlines(t)),
-            Node::Element(e) if e.name() == "br" => out.push('\n'),
+            Node::Text(t) => push_span(out, squash_newlines(t), style),
+            Node::Element(e) if e.name() == "br" => {
+                out.push(Span {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
+            }
+            Node::Element(e) if e.name() == "img" || e.name() == "image" || e.name() == "svg" => {}
             Node::Element(_) => {
                 if let Some(inner) = scraper::ElementRef::wrap(child) {
-                    out.push_str(&inline_text(inner));
+                    collect_element_spans(inner, style, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// All descendant text of `el` with `<br>` kept as newlines and inline tags
+/// mapped to span styles. Images contribute nothing.
+fn collect_inline_spans(el: scraper::ElementRef) -> Vec<Span> {
+    use scraper::node::Node;
+    let mut out = Vec::new();
+    for child in el.children() {
+        match child.value() {
+            Node::Text(t) => push_span(&mut out, squash_newlines(t), Style::default()),
+            Node::Element(e) if e.name() == "br" => {
+                out.push(Span {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
+            }
+            Node::Element(e) if e.name() == "img" || e.name() == "image" || e.name() == "svg" => {}
+            Node::Element(_) => {
+                if let Some(inner) = scraper::ElementRef::wrap(child) {
+                    collect_element_spans(inner, Style::default(), &mut out);
                 }
             }
             _ => {}
@@ -276,35 +398,228 @@ fn inline_text(el: scraper::ElementRef) -> String {
     out
 }
 
-/// Flush accumulated inline text into paragraph blocks. Blank lines (from
+/// Collapse one line's chars: trim ends, single-space inner runs. Spaces take
+/// the preceding style so mono/bold widths stay consistent.
+fn collapse_line(chars: &[(char, Style)]) -> Vec<(char, Style)> {
+    let mut out = Vec::new();
+    let mut pending_space: Option<Style> = None;
+    let mut started = false;
+    for (c, s) in chars {
+        if c.is_whitespace() {
+            if started && pending_space.is_none() {
+                pending_space = Some(*s);
+            }
+        } else {
+            if let Some(sp) = pending_space.take() {
+                // Space inherits the previous non-space style when possible.
+                let use_style = out.last().map(|(_, ps): &(_, Style)| *ps).unwrap_or(sp);
+                out.push((' ', use_style));
+            }
+            out.push((*c, *s));
+            started = true;
+        }
+    }
+    out
+}
+
+/// Split spans on explicit newlines (`<br>`), collapse whitespace per line,
+/// and regroup blank-line-separated lines into paragraphs. Single newlines
+/// survive inside a paragraph; blank lines start a new one.
+fn spans_to_paragraphs(spans: Vec<Span>) -> Vec<Vec<Span>> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in &spans {
+        let st = style_of_span(s);
+        for c in s.text.chars() {
+            chars.push((c, st));
+        }
+    }
+    // Split on '\n' (from <br>); other newlines were already squashed.
+    let mut lines: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    for (c, s) in chars {
+        if c == '\n' {
+            lines.push(Vec::new());
+        } else {
+            lines.last_mut().unwrap().push((c, s));
+        }
+    }
+    let mut paras: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    for line in lines {
+        let collapsed = collapse_line(&line);
+        if collapsed.is_empty() {
+            if !cur.is_empty() {
+                paras.push(std::mem::take(&mut cur));
+            }
+        } else {
+            if !cur.is_empty() {
+                cur.push(('\n', Style::default()));
+            }
+            cur.extend(collapsed);
+        }
+    }
+    if !cur.is_empty() {
+        paras.push(cur);
+    }
+    paras
+        .into_iter()
+        .filter_map(|para| {
+            let mut spans: Vec<Span> = Vec::new();
+            for (c, s) in para {
+                let txt = c.to_string();
+                if let Some(last) = spans.last_mut() {
+                    if style_of_span(last) == s {
+                        last.text.push_str(&txt);
+                        continue;
+                    }
+                }
+                spans.push(Span {
+                    text: txt,
+                    bold: s.bold,
+                    italic: s.italic,
+                    strike: s.strike,
+                    underline: s.underline,
+                    mono: s.mono,
+                });
+            }
+            // Merge single-char runs already handled; drop empties.
+            spans.retain(|sp| !sp.text.is_empty());
+            // Merge adjacent same-style runs (newline splits created many).
+            let mut merged: Vec<Span> = Vec::new();
+            for sp in spans {
+                if let Some(last) = merged.last_mut() {
+                    if style_of_span(last) == style_of_span(&sp) {
+                        last.text.push_str(&sp.text);
+                        continue;
+                    }
+                }
+                merged.push(sp);
+            }
+            if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            }
+        })
+        .collect()
+}
+
+/// Single-line normalisation for headings and list items: all runs of
+/// whitespace (including `<br>`) collapse to one space.
+fn single_line_spans(spans: Vec<Span>) -> Vec<Span> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in &spans {
+        let st = style_of_span(s);
+        for c in s.text.chars() {
+            chars.push((if c == '\n' { ' ' } else { c }, st));
+        }
+    }
+    let collapsed = collapse_line(&chars);
+    let mut out: Vec<Span> = Vec::new();
+    for (c, s) in collapsed {
+        let txt = c.to_string();
+        if let Some(last) = out.last_mut() {
+            if style_of_span(last) == s {
+                last.text.push_str(&txt);
+                continue;
+            }
+        }
+        out.push(Span {
+            text: txt,
+            bold: s.bold,
+            italic: s.italic,
+            strike: s.strike,
+            underline: s.underline,
+            mono: s.mono,
+        });
+    }
+    out
+}
+
+/// List items preserve single `<br>` breaks but never split into paragraphs.
+fn list_item_spans(spans: Vec<Span>) -> Vec<Span> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in &spans {
+        let st = style_of_span(s);
+        for c in s.text.chars() {
+            chars.push((c, st));
+        }
+    }
+    let mut lines: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    for (c, s) in chars {
+        if c == '\n' {
+            lines.push(Vec::new());
+        } else {
+            lines.last_mut().unwrap().push((c, s));
+        }
+    }
+    let mut joined: Vec<(char, Style)> = Vec::new();
+    for line in lines {
+        let collapsed = collapse_line(&line);
+        if collapsed.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(('\n', Style::default()));
+        }
+        joined.extend(collapsed);
+    }
+    let mut out: Vec<Span> = Vec::new();
+    for (c, s) in joined {
+        let txt = c.to_string();
+        if let Some(last) = out.last_mut() {
+            if style_of_span(last) == s {
+                last.text.push_str(&txt);
+                continue;
+            }
+        }
+        out.push(Span {
+            text: txt,
+            bold: s.bold,
+            italic: s.italic,
+            strike: s.strike,
+            underline: s.underline,
+            mono: s.mono,
+        });
+    }
+    out
+}
+
+/// Raw text for `<pre>`: significant whitespace kept, tags ignored.
+fn pre_text(el: scraper::ElementRef) -> String {
+    use scraper::node::Node;
+    fn walk(el: scraper::ElementRef, out: &mut String) {
+        for child in el.children() {
+            match child.value() {
+                Node::Text(t) => out.push_str(t),
+                Node::Element(e) if e.name() == "br" => out.push('\n'),
+                Node::Element(e)
+                    if e.name() == "img" || e.name() == "image" || e.name() == "svg" => {}
+                Node::Element(_) => {
+                    if let Some(inner) = scraper::ElementRef::wrap(child) {
+                        walk(inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut raw = String::new();
+    walk(el, &mut raw);
+    let decoded = html_escape::decode_html_entities(&raw).into_owned();
+    decoded.replace('\r', "")
+}
+
+/// Flush accumulated inline spans into paragraph blocks. Blank lines (from
 /// `<br><br>` or block boundaries) start new paragraphs; single newlines
 /// (from a lone `<br>`) are preserved as line breaks inside the block.
-fn push_text_blocks(pending: &mut String, out: &mut Vec<Block>) {
-    if pending.trim().is_empty() {
+fn push_text_blocks(pending: &mut Vec<Span>, out: &mut Vec<Block>) {
+    if spans_plain(pending).trim().is_empty() {
         pending.clear();
         return;
     }
-    let decoded = html_escape::decode_html_entities(pending).into_owned();
-    let mut current = String::new();
-    let mut chunks: Vec<String> = Vec::new();
-    for line in decoded.lines() {
-        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if line.is_empty() {
-            if !current.trim().is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-        } else {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            current.push_str(&line);
-        }
-    }
-    if !current.trim().is_empty() {
-        chunks.push(current);
-    }
-    for c in chunks {
-        out.push(Block::Paragraph(c));
+    let spans = std::mem::take(pending);
+    for para in spans_to_paragraphs(spans) {
+        out.push(Block::Paragraph(para));
     }
     pending.clear();
 }
@@ -314,14 +629,17 @@ where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
     use scraper::node::Node;
-    let mut pending = String::new();
+    let mut pending: Vec<Span> = Vec::new();
     for child in parent.children() {
         match child.value() {
             Node::Text(t) => {
-                pending.push_str(&squash_newlines(t));
+                push_span(&mut pending, squash_newlines(t), Style::default());
             }
             Node::Element(e) if e.name() == "br" => {
-                pending.push('\n');
+                pending.push(Span {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
             }
             Node::Element(e) if e.name() == "img" => {
                 // Illustrations are block-level, but only split the paragraph
@@ -341,7 +659,7 @@ where
             Node::Element(e) if e.name() == "image" || e.name() == "svg" => {}
             Node::Element(e) if is_inline(e.name()) => {
                 if let Some(inner) = scraper::ElementRef::wrap(child) {
-                    pending.push_str(&inline_text(inner));
+                    collect_element_spans(inner, Style::default(), &mut pending);
                 }
             }
             Node::Element(_) => {
@@ -358,11 +676,10 @@ where
     push_text_blocks(&mut pending, out);
     // Fallback: if nothing collected, use all text as paragraphs.
     if out.is_empty() {
-        let t = text_of(parent);
-        for para in t.split("\n\n") {
-            let p = para.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !p.is_empty() {
-                out.push(Block::Paragraph(p));
+        let spans = collect_inline_spans(parent);
+        if !spans_plain(&spans).trim().is_empty() {
+            for para in spans_to_paragraphs(spans) {
+                out.push(Block::Paragraph(para));
             }
         }
     }
@@ -376,10 +693,30 @@ where
 {
     let tag = el.value().name();
     match tag {
-        "h1" => out.push(Block::Heading(1, text_of(el))),
-        "h2" => out.push(Block::Heading(2, text_of(el))),
-        "h3" => out.push(Block::Heading(3, text_of(el))),
-        "h4" | "h5" | "h6" => out.push(Block::Heading(4, text_of(el))),
+        "h1" => {
+            let spans = single_line_spans(collect_inline_spans(el));
+            if !spans_plain(&spans).trim().is_empty() {
+                out.push(Block::Heading(1, spans));
+            }
+        }
+        "h2" => {
+            let spans = single_line_spans(collect_inline_spans(el));
+            if !spans_plain(&spans).trim().is_empty() {
+                out.push(Block::Heading(2, spans));
+            }
+        }
+        "h3" => {
+            let spans = single_line_spans(collect_inline_spans(el));
+            if !spans_plain(&spans).trim().is_empty() {
+                out.push(Block::Heading(3, spans));
+            }
+        }
+        "h4" | "h5" | "h6" => {
+            let spans = single_line_spans(collect_inline_spans(el));
+            if !spans_plain(&spans).trim().is_empty() {
+                out.push(Block::Heading(4, spans));
+            }
+        }
         "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "aside" | "nav"
         | "address" | "figure" | "figcaption" | "details" | "summary" | "table" | "thead"
         | "tbody" | "tfoot" | "tr" | "td" | "th" | "dl" | "dt" | "dd" | "form" => {
@@ -395,7 +732,12 @@ where
                 }
             }
         }
-        "pre" => out.push(Block::Pre(el.inner_html())),
+        "pre" => {
+            let t = pre_text(el);
+            if !t.trim().is_empty() {
+                out.push(Block::Pre(t));
+            }
+        }
         "ul" | "ol" => {
             // Direct items only: nested lists render as their own items.
             let mut any = false;
@@ -406,9 +748,9 @@ where
                 if li.value().name() != "li" {
                     continue;
                 }
-                let t = text_of(li);
-                if !t.is_empty() {
-                    out.push(Block::ListItem(t));
+                let spans = list_item_spans(collect_inline_spans(li));
+                if !spans_plain(&spans).trim().is_empty() {
+                    out.push(Block::ListItem(spans));
                     any = true;
                 }
             }
@@ -418,9 +760,9 @@ where
             }
         }
         "li" => {
-            let t = text_of(el);
-            if !t.is_empty() {
-                out.push(Block::ListItem(t));
+            let spans = list_item_spans(collect_inline_spans(el));
+            if !spans_plain(&spans).trim().is_empty() {
+                out.push(Block::ListItem(spans));
             }
         }
         "hr" => {
@@ -435,7 +777,8 @@ where
             if has_el_children {
                 collect_blocks(el, out, lookup);
             } else {
-                let mut pending = inline_text(el);
+                let spans = collect_inline_spans(el);
+                let mut pending = spans;
                 push_text_blocks(&mut pending, out);
             }
         }
@@ -621,8 +964,13 @@ pub fn block_chars(b: &Block) -> usize {
     if matches!(b, Block::Image { .. }) {
         return 400;
     }
-    let t = block_text(b);
-    let n = t.chars().count();
+    let n = match b {
+        Block::Heading(_, s) | Block::Paragraph(s) | Block::Quote(s) | Block::ListItem(s) => {
+            spans_len(s)
+        }
+        Block::Pre(t) => t.chars().count(),
+        Block::Image { .. } => 0,
+    };
     match b {
         Block::Heading(_, _) => n + 40,
         Block::Pre(_) => n / 2,
@@ -675,6 +1023,76 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Split styled spans into chunks of at most `max_chars` plain characters,
+/// preserving per-span flags. Cuts prefer whitespace; newline characters are
+/// treated as whitespace boundaries and never start a chunk. Always makes
+/// progress.
+pub fn chunk_spans(spans: &[Span], max_chars: usize) -> Vec<Vec<Span>> {
+    let max_chars = max_chars.max(1);
+    // Flatten to chars with styles.
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in spans {
+        let st = style_of_span(s);
+        for c in s.text.chars() {
+            chars.push((c, st));
+        }
+    }
+    if chars.len() <= max_chars {
+        return vec![spans.to_vec()];
+    }
+    let mut chunks: Vec<Vec<Span>> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + max_chars).min(chars.len());
+        if end < chars.len() {
+            let mut cut = end;
+            while cut > start && !chars[cut].0.is_whitespace() && end - cut < max_chars / 2 {
+                cut -= 1;
+            }
+            if cut > start && chars[cut].0.is_whitespace() {
+                end = cut;
+            }
+        }
+        // Build spans for [start, end).
+        let mut out: Vec<Span> = Vec::new();
+        for (c, st) in &chars[start..end] {
+            let txt = c.to_string();
+            if let Some(last) = out.last_mut() {
+                if style_of_span(last) == *st {
+                    last.text.push_str(&txt);
+                    continue;
+                }
+            }
+            out.push(Span {
+                text: txt,
+                bold: st.bold,
+                italic: st.italic,
+                strike: st.strike,
+                underline: st.underline,
+                mono: st.mono,
+            });
+        }
+        // Drop whitespace-only chunks to guarantee progress.
+        if spans_plain(&out).trim().is_empty() {
+            start = end.max(start + 1);
+            continue;
+        }
+        chunks.push(out);
+        start = end;
+        while start < chars.len() && chars[start].0.is_whitespace() {
+            start += 1;
+        }
+    }
+    if chunks.is_empty() {
+        // Fallback: trimmed single chunk preserving the first style.
+        let trimmed = spans_plain(spans).trim().to_string();
+        if !trimmed.is_empty() {
+            chunks.push(plain_spans(&trimmed));
+        }
+    }
+    chunks
+}
+
 /// Whether `Auto` column mode should use two columns for this width.
 /// Always two columns unless the viewport is too narrow for two comfortable
 /// reading columns (two minimum-width columns plus the inter-column gap).
@@ -688,18 +1106,25 @@ pub fn auto_two_columns(content_w: f32, _total: usize) -> bool {
 mod tests {
     use super::*;
 
-    fn texts(blocks: &[Block]) -> Vec<&str> {
+    fn texts(blocks: &[Block]) -> Vec<String> {
         blocks
             .iter()
             .map(|b| match b {
-                Block::Heading(_, t)
-                | Block::Paragraph(t)
-                | Block::Quote(t)
-                | Block::ListItem(t)
-                | Block::Pre(t) => t.as_str(),
-                Block::Image { alt, .. } => alt.as_str(),
+                Block::Heading(_, s)
+                | Block::Paragraph(s)
+                | Block::Quote(s)
+                | Block::ListItem(s) => spans_plain(s),
+                Block::Pre(t) => t.clone(),
+                Block::Image { alt, .. } => alt.clone(),
             })
             .collect()
+    }
+
+    fn spans_of(block: &Block) -> &[Span] {
+        match block {
+            Block::Heading(_, s) | Block::Paragraph(s) | Block::Quote(s) | Block::ListItem(s) => s,
+            Block::Pre(_) | Block::Image { .. } => &[],
+        }
     }
 
     #[test]
@@ -729,19 +1154,28 @@ mod tests {
             "<div><div>First.</div><div>Second.</div></div>",
             &mut |_: &str| None,
         );
-        assert_eq!(texts(&blocks), vec!["First.", "Second."]);
+        assert_eq!(
+            texts(&blocks),
+            vec!["First.".to_string(), "Second.".to_string()]
+        );
     }
 
     #[test]
     fn plain_paragraphs_stay_separate() {
         let blocks = html_to_blocks("<p>One.</p><p>Two.</p><p>Three.</p>", &mut |_: &str| None);
-        assert_eq!(texts(&blocks), vec!["One.", "Two.", "Three."]);
+        assert_eq!(
+            texts(&blocks),
+            vec!["One.".to_string(), "Two.".to_string(), "Three.".to_string()]
+        );
     }
 
     #[test]
     fn double_br_splits_paragraphs() {
         let blocks = html_to_blocks("<p>line one<br><br>line two</p>", &mut |_: &str| None);
-        assert_eq!(texts(&blocks), vec!["line one", "line two"]);
+        assert_eq!(
+            texts(&blocks),
+            vec!["line one".to_string(), "line two".to_string()]
+        );
     }
 
     #[test]
@@ -754,13 +1188,81 @@ mod tests {
     #[test]
     fn mixed_content_keeps_order() {
         let blocks = html_to_blocks("<div>Intro<p>Body.</p>Tail.</div>", &mut |_: &str| None);
-        assert_eq!(texts(&blocks), vec!["Intro", "Body.", "Tail."]);
+        assert_eq!(
+            texts(&blocks),
+            vec![
+                "Intro".to_string(),
+                "Body.".to_string(),
+                "Tail.".to_string()
+            ]
+        );
     }
 
     #[test]
     fn inline_markup_stays_in_flow() {
         let blocks = html_to_blocks("<p>foo <b>bar</b> baz</p>", &mut |_: &str| None);
-        assert_eq!(texts(&blocks), vec!["foo bar baz"]);
+        assert_eq!(texts(&blocks), vec!["foo bar baz".to_string()]);
+    }
+
+    #[test]
+    fn inline_formatting_flags_survive() {
+        let blocks = html_to_blocks("<p>foo <b>bar</b> <i>baz</i></p>", &mut |_: &str| None);
+        assert_eq!(blocks.len(), 1);
+        let spans = spans_of(&blocks[0]);
+        assert_eq!(spans_plain(spans), "foo bar baz");
+        let bar = spans.iter().find(|s| s.text.contains("bar")).unwrap();
+        assert!(bar.bold);
+        assert!(!bar.italic);
+        let baz = spans.iter().find(|s| s.text.contains("baz")).unwrap();
+        assert!(baz.italic);
+        assert!(!baz.bold);
+    }
+
+    #[test]
+    fn underline_strike_mono_and_links() {
+        let blocks = html_to_blocks(
+            "<p><u>u</u> <s>s</s> <del>d</del> <code>c</code> <a href=\"x\">link</a></p>",
+            &mut |_: &str| None,
+        );
+        assert_eq!(blocks.len(), 1);
+        let spans = spans_of(&blocks[0]);
+        let find = |t: &str| spans.iter().find(|s| s.text.contains(t)).unwrap().clone();
+        assert!(find("u").underline);
+        assert!(find("s").strike);
+        assert!(find("d").strike);
+        assert!(find("c").mono);
+        assert!(find("link").underline);
+    }
+
+    #[test]
+    fn nested_formatting_combines() {
+        let blocks = html_to_blocks("<p><b><i>both</i></b></p>", &mut |_: &str| None);
+        let spans = spans_of(&blocks[0]);
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].bold && spans[0].italic);
+    }
+
+    #[test]
+    fn chunk_spans_preserves_flags_and_text() {
+        let spans = vec![
+            Span {
+                text: "aaa bbb ccc".to_string(),
+                bold: true,
+                ..Default::default()
+            },
+            Span {
+                text: " ddd".to_string(),
+                italic: true,
+                ..Default::default()
+            },
+        ];
+        let chunks = chunk_spans(&spans, 7);
+        assert!(chunks.iter().all(|c| spans_len(c) <= 7));
+        let joined: String = chunks.iter().map(|c| spans_plain(c)).collect();
+        assert_eq!(joined.replace(' ', ""), "aaabbbcccddd");
+        // Bold survives on the first chunk, italic on the last.
+        assert!(chunks.first().unwrap().iter().any(|s| s.bold));
+        assert!(chunks.last().unwrap().iter().any(|s| s.italic));
     }
 
     /// Tiny valid PNG bytes for image tests (solid color, no files needed).
@@ -825,7 +1327,7 @@ mod tests {
             "<div>Before. <img src=\"gone.png\"/> After.</div>",
             &mut lookup,
         );
-        assert_eq!(texts(&blocks), vec!["Before. After."]);
+        assert_eq!(texts(&blocks), vec!["Before. After.".to_string()]);
     }
 
     #[test]

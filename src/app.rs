@@ -1,4 +1,4 @@
-use crate::epub_utils::{self, Block, Chapter, TocEntry};
+use crate::epub_utils::{self, plain_spans, spans_plain, Block, Chapter, TocEntry};
 use crate::fanficfare;
 use crate::fonts;
 use crate::library::{AddOutcome, Book, Library, SortKey};
@@ -11,6 +11,7 @@ enum JobEvent {
     Message(String),
     Refresh,
     ReaderReload(i64),
+    CheckDone(Vec<(i64, fanficfare::CheckState)>),
     Done(String),
     Error(String),
 }
@@ -82,6 +83,19 @@ fn is_page_turn_key(key: egui::Key) -> bool {
     )
 }
 
+/// A book can be update-checked when it carries a FanFicFare source URL
+/// (set at import from the EPUB metadata, preserved across updates).
+fn is_updatable(b: &Book) -> bool {
+    b.fanfic_url.as_ref().is_some_and(|u| !u.trim().is_empty())
+}
+
+/// Char-index slice of `s` (`start..end` in chars, clamped). Never panics on
+/// multi-byte boundaries.
+fn slice_chars(s: &str, start: usize, end: usize) -> String {
+    let (lo, hi) = (start.min(end), start.max(end));
+    s.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+}
+
 /// One page of a chapter: `flow[start..end]`, optionally split across two
 /// columns at `split` (an index into `flow`; `None` renders full width).
 #[derive(Debug, Clone)]
@@ -89,6 +103,15 @@ struct PageDef {
     start: usize,
     end: usize,
     split: Option<usize>,
+}
+
+/// One text block's on-screen rect for reader text selection hit-testing.
+/// `flow_idx` indexes into `flow`; `col` is 0 (left/single) or 1 (right).
+#[derive(Debug, Clone)]
+struct SelBlock {
+    flow_idx: usize,
+    rect: egui::Rect,
+    col: u8,
 }
 
 /// An enlarged inline image shown in a modal overlay.
@@ -132,6 +155,11 @@ struct PagesKey {
 pub struct MarginaliaApp {
     lib: Library,
     books: Vec<Book>,
+    /// Library-wide update eligibility, refreshed with the book list.
+    tracked_count: usize,
+    library_total: usize,
+    /// Session-only update-check results by book id.
+    check_state: HashMap<i64, fanficfare::CheckState>,
     query: String,
     /// Stable widget id for the library search box (keyboard-nav guard).
     search_id: egui::Id,
@@ -162,11 +190,23 @@ pub struct MarginaliaApp {
     last_geom_change: std::time::Instant,
     built_two_col: bool,
     chrome_opacity: f32,
+    /// True while the OS cursor is hidden for faded reader chrome.
+    cursor_hidden: bool,
     /// Enlarged inline image overlay, if open.
     lightbox: Option<Lightbox>,
     /// True while the lightbox was opened this frame: skips the click-outside
     /// check so the opening click can't instantly dismiss it.
     lightbox_new: bool,
+    /// Cross-column drag selection: anchor/active as (flow index, char offset
+    /// in layout text). Cleared on page/chapter turn and reflow.
+    sel_anchor: Option<(usize, usize)>,
+    sel_active: Option<(usize, usize)>,
+    /// True while the primary button is held down starting on reader text.
+    sel_dragging: bool,
+    /// On-screen rects of the current page's text blocks (previous frame).
+    sel_rects: Vec<SelBlock>,
+    /// Column width the cached `sel_rects` were laid out with.
+    sel_col_w: f32,
     textures: HashMap<String, egui::TextureHandle>,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
@@ -210,6 +250,9 @@ impl MarginaliaApp {
         let mut app = Self {
             lib,
             books: vec![],
+            tracked_count: 0,
+            library_total: 0,
+            check_state: HashMap::new(),
             query: String::new(),
             search_id: egui::Id::unique("library-search"),
             sort: SortKey::Recent,
@@ -238,8 +281,14 @@ impl MarginaliaApp {
             last_geom_change: std::time::Instant::now(),
             built_two_col: false,
             chrome_opacity: 1.0,
+            cursor_hidden: false,
             lightbox: None,
             lightbox_new: false,
+            sel_anchor: None,
+            sel_active: None,
+            sel_dragging: false,
+            sel_rects: Vec::new(),
+            sel_col_w: 0.0,
             textures: HashMap::new(),
             tx,
             rx,
@@ -259,7 +308,46 @@ impl MarginaliaApp {
         };
         cc.egui_ctx.set_visuals(app.theme.visuals());
         app.refresh();
+        app.maybe_backfill_fanfic_urls();
         app
+    }
+
+    /// Link direct-AO3 downloads to their work URLs by scanning prefaces.
+    /// One startup background pass over untracked books only; results flow
+    /// back through the job channel and refresh the counts/markers.
+    fn maybe_backfill_fanfic_urls(&mut self) {
+        if self.library_total <= self.tracked_count {
+            return;
+        }
+        self.jobs.busy = true;
+        self.jobs.push("linking AO3 fics …".to_string());
+        let tx = self.tx.clone();
+        let root = self.lib.root.clone();
+        std::thread::spawn(move || {
+            let lib = match Library::open(root) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(JobEvent::Error(format!("open library: {e}")));
+                    return;
+                }
+            };
+            match lib.backfill_fanfic_urls() {
+                Ok(filled) => {
+                    if filled.is_empty() {
+                        let _ = tx.send(JobEvent::Done("fic links up to date".to_string()));
+                    } else {
+                        let _ = tx.send(JobEvent::Done(format!(
+                            "linked {} fic{} to AO3",
+                            filled.len(),
+                            if filled.len() == 1 { "" } else { "s" }
+                        )));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(JobEvent::Error(format!("fic link scan failed: {e}")));
+                }
+            }
+        });
     }
 
     /// Snapshot of the current display controls for persistence.
@@ -299,6 +387,17 @@ impl MarginaliaApp {
             }
             Err(e) => self.error = Some(format!("list failed: {e}")),
         }
+        // Library-wide update eligibility for the top bar counts. Kept
+        // separate from the (possibly query-filtered) book list.
+        self.tracked_count = self.lib.tracked().map(|v| v.len()).unwrap_or(0);
+        self.library_total = if self.query.trim().is_empty() {
+            self.books.len()
+        } else {
+            self.lib
+                .list("", SortKey::Recent)
+                .map(|v| v.len())
+                .unwrap_or(self.books.len())
+        };
     }
 
     fn selected_book(&self) -> Option<&Book> {
@@ -316,6 +415,11 @@ impl MarginaliaApp {
                 JobEvent::ReaderReload(id) => {
                     dirty = true;
                     reload_reader = Some(id);
+                }
+                JobEvent::CheckDone(results) => {
+                    for (id, state) in results {
+                        self.check_state.insert(id, state);
+                    }
                 }
                 JobEvent::Done(m) => {
                     self.jobs.push(m);
@@ -394,8 +498,20 @@ impl MarginaliaApp {
                 // the saved page is clamped there.
                 self.page = page;
                 self.pages_key = None;
+                self.clear_selection();
             }
             Err(e) => self.error = Some(format!("cannot read epub: {e}")),
+        }
+    }
+
+    /// Show or hide the OS cursor, sending a viewport command only on
+    /// transition. Cursor visibility follows the same fade target as the
+    /// reader chrome, so any suppression of the chrome hide also suppresses
+    /// the cursor hide.
+    fn sync_cursor(&mut self, ctx: &egui::Context, should_hide: bool) {
+        if should_hide != self.cursor_hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!should_hide));
+            self.cursor_hidden = should_hide;
         }
     }
 
@@ -412,6 +528,7 @@ impl MarginaliaApp {
         self.pages.clear();
         self.flow.clear();
         self.pages_key = None;
+        self.clear_selection();
         self.view = View::Library;
         self.refresh();
     }
@@ -424,6 +541,7 @@ impl MarginaliaApp {
         self.current = idx;
         self.page = 0;
         self.pages_key = None;
+        self.clear_selection();
         if let Some(b) = &self.reader_book {
             let _ = self.lib.save_progress(b.id, idx as i64, 0);
         }
@@ -434,6 +552,369 @@ impl MarginaliaApp {
             let _ = self
                 .lib
                 .save_progress(b.id, self.current as i64, self.page as i64);
+        }
+    }
+
+    /// Clear the reader text selection (page/chapter turn, reflow, dismiss).
+    fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+        self.sel_active = None;
+        self.sel_dragging = false;
+    }
+
+    /// Ordered selection endpoints, if a non-empty range is selected.
+    fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = (self.sel_anchor?, self.sel_active?);
+        if a == b {
+            return None;
+        }
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// Layout text of a block (what hit-testing and painting measure).
+    /// List items include the rendered bullet prefix.
+    fn layout_text_of(b: &Block) -> String {
+        match b {
+            Block::Heading(_, s) | Block::Paragraph(s) | Block::Quote(s) => spans_plain(s),
+            Block::ListItem(s) => format!("• {}", spans_plain(s)),
+            Block::Pre(t) => t.clone(),
+            Block::Image { .. } => String::new(),
+        }
+    }
+
+    /// Plain copy text of a block slice in layout-text coordinates.
+    /// The bullet prefix of list items never reaches the clipboard.
+    fn copy_slice_of(b: &Block, start: usize, end: usize) -> String {
+        let (s, e) = (start.min(end), start.max(end));
+        match b {
+            Block::Heading(_, spans) | Block::Paragraph(spans) | Block::Quote(spans) => {
+                slice_chars(&spans_plain(spans), s, e)
+            }
+            Block::Pre(t) => slice_chars(t, s, e),
+            Block::ListItem(spans) => {
+                // Layout text is "• {t}": strip the 2-char prefix.
+                let s = s.saturating_sub(2);
+                let e = e.saturating_sub(2);
+                slice_chars(&spans_plain(spans), s, e)
+            }
+            Block::Image { .. } => String::new(),
+        }
+    }
+
+    /// Selected text for the current page in reading order. Partial edge
+    /// blocks contribute their selected slice; fully covered blocks
+    /// contribute their trimmed text; images are skipped.
+    fn selection_text(&self) -> String {
+        let Some(((sb, sc), (eb, ec))) = self.ordered_selection() else {
+            return String::new();
+        };
+        let mut parts = Vec::new();
+        for idx in sb..=eb {
+            let Some(b) = self.flow.get(idx) else {
+                continue;
+            };
+            if matches!(b, Block::Image { .. }) {
+                continue;
+            }
+            let len = Self::layout_text_of(b).chars().count();
+            let (s, e) = if sb == eb {
+                (sc.min(ec), sc.max(ec))
+            } else if idx == sb {
+                (sc, len)
+            } else if idx == eb {
+                (0, ec)
+            } else {
+                (0, len)
+            };
+            let piece = Self::copy_slice_of(b, s, e);
+            if !piece.trim().is_empty() {
+                parts.push(piece.trim().to_string());
+            }
+        }
+        parts.join("\n\n")
+    }
+
+    /// Multi-section layout job preserving bold/italic/strike/underline/mono.
+    /// `text_color` is WHITE for measurement/hit-testing (size only) and the
+    /// theme text color for rendering. Returns `None` for images.
+    fn build_job(
+        &self,
+        b: &Block,
+        col_w: f32,
+        text_color: egui::Color32,
+        code_bg: egui::Color32,
+    ) -> Option<egui::text::LayoutJob> {
+        use crate::epub_utils::Span;
+        use egui::text::{LayoutJob, TextFormat};
+        if matches!(b, Block::Image { .. }) {
+            return None;
+        }
+        let w = match b {
+            Block::Quote(_) => (col_w - 12.0).max(80.0),
+            _ => col_w,
+        };
+        let size = self.block_size(b);
+        let line_height = self.block_line_height(b);
+        let base_weight = self.block_weight(b);
+        let reader_family = self.reader_family();
+        let is_quote = matches!(b, Block::Quote(_));
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = w;
+        job.halign = egui::Align::LEFT;
+        job.justify = false;
+        let base_format = TextFormat {
+            font_id: egui::FontId::new(size, reader_family.clone()),
+            line_height: Some(line_height),
+            color: text_color,
+            coords: egui::epaint::text::VariationCoords::new([(b"wght", base_weight)]),
+            ..Default::default()
+        };
+        let format_for = |span: &Span| -> TextFormat {
+            let weight = if span.bold {
+                (base_weight + 250.0).min(800.0)
+            } else {
+                base_weight
+            };
+            TextFormat {
+                font_id: if span.mono {
+                    egui::FontId::new(size, egui::FontFamily::Monospace)
+                } else {
+                    egui::FontId::new(size, reader_family.clone())
+                },
+                line_height: Some(line_height),
+                color: text_color,
+                coords: egui::epaint::text::VariationCoords::new([(b"wght", weight)]),
+                italics: span.italic || is_quote,
+                underline: if span.underline {
+                    egui::Stroke::new(1.0, text_color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                strikethrough: if span.strike {
+                    egui::Stroke::new(1.0, text_color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                ..Default::default()
+            }
+        };
+        match b {
+            Block::Heading(_, spans) | Block::Paragraph(spans) | Block::Quote(spans) => {
+                for s in spans {
+                    if s.text.is_empty() {
+                        continue;
+                    }
+                    job.append(&s.text, 0.0, format_for(s));
+                }
+            }
+            Block::ListItem(spans) => {
+                job.append("• ", 0.0, base_format.clone());
+                for s in spans {
+                    if s.text.is_empty() {
+                        continue;
+                    }
+                    job.append(&s.text, 0.0, format_for(s));
+                }
+            }
+            Block::Pre(t) => {
+                let mut f = base_format.clone();
+                f.font_id = egui::FontId::new(size, egui::FontFamily::Monospace);
+                f.background = code_bg;
+                job.append(t, 0.0, f);
+            }
+            Block::Image { .. } => return None,
+        }
+        if job.sections.is_empty() {
+            job.append("", 0.0, base_format);
+        }
+        Some(job)
+    }
+
+    /// Build the layout job for a block exactly like `measure_label`, so
+    /// hit-testing and highlight painting agree with what was drawn.
+    /// Returns `None` for images (no text layout).
+    fn block_selection_job(&self, b: &Block, col_w: f32) -> Option<egui::text::LayoutJob> {
+        self.build_job(b, col_w, egui::Color32::WHITE, egui::Color32::TRANSPARENT)
+    }
+
+    /// Char offset in a block's layout text for a pointer position.
+    /// `rect` is the label rect captured at render time.
+    fn block_cursor(
+        &self,
+        ui: &mut egui::Ui,
+        b: &Block,
+        rect: egui::Rect,
+        col_w: f32,
+        pos: egui::Pos2,
+    ) -> usize {
+        let Some(job) = self.block_selection_job(b, col_w) else {
+            return 0;
+        };
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let local = pos - rect.left_top();
+        galley.cursor_from_pos(local).index.0
+    }
+
+    /// Map a pointer position to a (flow index, char offset) using the
+    /// previous frame's block rects. Column-aware: the gutter snaps at its
+    /// midpoint so crossing columns immediately tracks the new column by y.
+    fn hit_test(&self, ui: &mut egui::Ui, pos: egui::Pos2, col_w: f32) -> Option<(usize, usize)> {
+        if self.sel_rects.is_empty() {
+            return None;
+        }
+        let two_col = self.sel_rects.iter().any(|r| r.col == 1);
+        let col = if two_col {
+            let left_max = self
+                .sel_rects
+                .iter()
+                .filter(|r| r.col == 0)
+                .map(|r| r.rect.max.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let right_min = self
+                .sel_rects
+                .iter()
+                .filter(|r| r.col == 1)
+                .map(|r| r.rect.min.x)
+                .fold(f32::INFINITY, f32::min);
+            let mid = if left_max.is_finite() && right_min.is_finite() {
+                (left_max + right_min) / 2.0
+            } else {
+                pos.x
+            };
+            if pos.x < mid {
+                0
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        let mut cands: Vec<&SelBlock> = self.sel_rects.iter().filter(|r| r.col == col).collect();
+        if cands.is_empty() {
+            return None;
+        }
+        cands.sort_by(|a, b| {
+            a.rect
+                .min
+                .y
+                .partial_cmp(&b.rect.min.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Direct hit first.
+        for r in &cands {
+            if r.rect.contains(pos) {
+                let Some(b) = self.flow.get(r.flow_idx) else {
+                    continue;
+                };
+                let c = self.block_cursor(ui, b, r.rect, col_w, pos);
+                return Some((r.flow_idx, c));
+            }
+        }
+        // Above the column: start of its first block.
+        if pos.y <= cands[0].rect.min.y {
+            return Some((cands[0].flow_idx, 0));
+        }
+        // Below the column: end of its last block.
+        if pos.y >= cands[cands.len() - 1].rect.max.y {
+            let last = cands[cands.len() - 1];
+            let len = self
+                .flow
+                .get(last.flow_idx)
+                .map(|b| Self::layout_text_of(b).chars().count())
+                .unwrap_or(0);
+            return Some((last.flow_idx, len));
+        }
+        // In a gap between blocks: snap to the end of the block above so the
+        // selection stays continuous while dragging.
+        let mut above = cands[0];
+        for r in &cands {
+            if r.rect.min.y <= pos.y {
+                above = r;
+            } else {
+                break;
+            }
+        }
+        let len = self
+            .flow
+            .get(above.flow_idx)
+            .map(|b| Self::layout_text_of(b).chars().count())
+            .unwrap_or(0);
+        Some((above.flow_idx, len))
+    }
+
+    /// Whether a pointer position is on the page text (with a small margin
+    /// so drags can start at glyph edges).
+    fn pointer_in_text(&self, pos: egui::Pos2) -> bool {
+        self.sel_rects
+            .iter()
+            .any(|r| r.rect.expand(4.0).contains(pos))
+    }
+
+    /// Paint the current selection as translucent row ranges over the text.
+    /// Must run after the page rendered (uses fresh rects + rebuilt galleys).
+    fn paint_selection(&self, ui: &mut egui::Ui, rects: &[SelBlock], col_w: f32) {
+        use egui::text::CCursor;
+        let Some(((sb, sc), (eb, ec))) = self.ordered_selection() else {
+            return;
+        };
+        let mut fill = ui.visuals().selection.bg_fill;
+        fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 110);
+        for r in rects {
+            if r.flow_idx < sb || r.flow_idx > eb {
+                continue;
+            }
+            let Some(b) = self.flow.get(r.flow_idx) else {
+                continue;
+            };
+            let len = Self::layout_text_of(b).chars().count();
+            let (s, e) = if sb == eb {
+                (sc.min(ec), sc.max(ec))
+            } else if r.flow_idx == sb {
+                (sc, len)
+            } else if r.flow_idx == eb {
+                (0, ec)
+            } else {
+                (0, len)
+            };
+            let (s, e) = (s.min(len), e.min(len));
+            if s >= e {
+                continue;
+            }
+            let Some(job) = self.block_selection_job(b, col_w) else {
+                continue;
+            };
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            let start = galley.layout_from_cursor(CCursor::new(s));
+            let end = galley.layout_from_cursor(CCursor::new(e));
+            let (srow, erow) = (start.row.min(end.row), start.row.max(end.row));
+            let (scol, ecol) = if start.row <= end.row {
+                (start.column, end.column)
+            } else {
+                (end.column, start.column)
+            };
+            for ri in srow..=erow {
+                let Some(placed) = galley.rows.get(ri) else {
+                    continue;
+                };
+                let left = if ri == srow {
+                    placed.row.x_offset(scol)
+                } else {
+                    0.0
+                };
+                let right = if ri == erow {
+                    placed.row.x_offset(ecol)
+                } else {
+                    placed.row.size.x
+                };
+                if right <= left {
+                    continue;
+                }
+                let min = r.rect.left_top() + placed.pos.to_vec2() + egui::vec2(left, 0.0);
+                let max =
+                    r.rect.left_top() + placed.pos.to_vec2() + egui::vec2(right, placed.row.size.y);
+                ui.painter()
+                    .rect_filled(egui::Rect::from_min_max(min, max), 0.0, fill);
+            }
         }
     }
 
@@ -501,6 +982,7 @@ impl MarginaliaApp {
         if self.chapters.is_empty() {
             return;
         }
+        self.clear_selection();
         let last = self.pages.len().saturating_sub(1);
         if self.page < last || self.pages.is_empty() {
             // saturating_add: `page` can transiently be the usize::MAX
@@ -514,6 +996,7 @@ impl MarginaliaApp {
 
     /// Page turn backward. Returns to the end of the previous chapter.
     fn prev_page(&mut self) {
+        self.clear_selection();
         if self.page > 0 {
             self.page -= 1;
             self.save_page();
@@ -619,6 +1102,11 @@ impl MarginaliaApp {
                     match lib.replace_file(book.id, &tmp_epub) {
                         Ok(nb) => {
                             let _ = tx.send(JobEvent::ReaderReload(nb.id));
+                            // Freshly imported: local matches remote.
+                            let _ = tx.send(JobEvent::CheckDone(vec![(
+                                nb.id,
+                                fanficfare::CheckState::UpToDate,
+                            )]));
                             let _ = tx.send(JobEvent::Done(format!("updated {}", nb.title)));
                         }
                         Err(e) => {
@@ -633,7 +1121,9 @@ impl MarginaliaApp {
         });
     }
 
-    fn start_update_all(&mut self) {
+    /// Metadata-only update check over tracked books (session-only results).
+    /// Compares remote chapter counts against local EPUBs without downloading.
+    fn start_check_updates(&mut self) {
         if !fanficfare::is_available() {
             self.error = Some("fanficfare not found on PATH.".into());
             return;
@@ -644,7 +1134,99 @@ impl MarginaliaApp {
             return;
         }
         self.jobs.busy = true;
-        self.jobs.push(format!("updating {} fics …", tracked.len()));
+        self.jobs.push(format!("checking {} fics …", tracked.len()));
+        let tx = self.tx.clone();
+        let root = self.lib.root.clone();
+        let items: Vec<(i64, String, String)> = tracked
+            .into_iter()
+            .map(|b| (b.id, b.title, b.fanfic_url.unwrap_or_default()))
+            .collect();
+        std::thread::spawn(move || {
+            let lib = match Library::open(root) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(JobEvent::Error(format!("open library: {e}")));
+                    return;
+                }
+            };
+            let mut results = Vec::new();
+            let mut avail = 0;
+            for (id, title, url) in &items {
+                let _ = tx.send(JobEvent::Message(format!("checking {title} …")));
+                let local = lib
+                    .get_by_id(*id)
+                    .ok()
+                    .flatten()
+                    .map(|b| {
+                        crate::epub_utils::chapter_count(&lib.abs_path(&b.file_path))
+                            .unwrap_or(1)
+                            .max(1) as usize
+                    })
+                    .unwrap_or(0);
+                match fanficfare::fetch_meta(url, std::time::Duration::from_secs(45)) {
+                    Ok(meta) => match fanficfare::compare_chapters(local, meta.chapters) {
+                        Some(state @ fanficfare::CheckState::UpdateAvailable { .. }) => {
+                            avail += 1;
+                            results.push((*id, state));
+                        }
+                        Some(state) => results.push((*id, state)),
+                        None => {
+                            let _ = tx.send(JobEvent::Message(format!(
+                                "check {title}: no chapter count"
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        let first = e
+                            .lines()
+                            .next()
+                            .unwrap_or(&e)
+                            .chars()
+                            .take(160)
+                            .collect::<String>();
+                        let _ =
+                            tx.send(JobEvent::Message(format!("check {title} failed: {first}")));
+                    }
+                }
+            }
+            let _ = tx.send(JobEvent::CheckDone(results));
+            let _ = tx.send(JobEvent::Done(format!(
+                "check complete: {avail} update{} available",
+                if avail == 1 { "" } else { "s" }
+            )));
+        });
+    }
+
+    fn start_update_all(&mut self) {
+        if !fanficfare::is_available() {
+            self.error = Some("fanficfare not found on PATH.".into());
+            return;
+        }
+        let tracked = self.lib.tracked().unwrap_or_default();
+        if tracked.is_empty() {
+            self.error = Some("no FanFicFare-tracked books.".into());
+            return;
+        }
+        // Skip books a session check already proved up to date.
+        let skip: Vec<i64> = tracked
+            .iter()
+            .filter(|b| self.check_state.get(&b.id) == Some(&fanficfare::CheckState::UpToDate))
+            .map(|b| b.id)
+            .collect();
+        if skip.len() == tracked.len() {
+            self.jobs.push("all tracked fics up to date".to_string());
+            return;
+        }
+        self.jobs.busy = true;
+        self.jobs.push(format!(
+            "updating {} fics …{}",
+            tracked.len() - skip.len(),
+            if skip.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} up to date)", skip.len())
+            }
+        ));
         let tx = self.tx.clone();
         let root = self.lib.root.clone();
         let ids: Vec<(i64, String)> = tracked.into_iter().map(|b| (b.id, b.title)).collect();
@@ -658,7 +1240,14 @@ impl MarginaliaApp {
             };
             let mut ok = 0;
             let mut fail = 0;
+            let mut skipped = 0;
+            let mut fresh = Vec::new();
             for (id, title) in ids {
+                if skip.contains(&id) {
+                    skipped += 1;
+                    let _ = tx.send(JobEvent::Message(format!("skipped {title} (up to date)")));
+                    continue;
+                }
                 let _ = tx.send(JobEvent::Message(format!("updating {title} …")));
                 let Some(book) = lib.get_by_id(id).ok().flatten() else {
                     continue;
@@ -680,6 +1269,7 @@ impl MarginaliaApp {
                     Ok(_) => match lib.replace_file(id, &tmp_epub) {
                         Ok(_) => {
                             ok += 1;
+                            fresh.push((id, fanficfare::CheckState::UpToDate));
                             let _ = tx.send(JobEvent::ReaderReload(id));
                         }
                         Err(_) => fail += 1,
@@ -687,8 +1277,11 @@ impl MarginaliaApp {
                     Err(_) => fail += 1,
                 }
             }
+            if !fresh.is_empty() {
+                let _ = tx.send(JobEvent::CheckDone(fresh));
+            }
             let _ = tx.send(JobEvent::Done(format!(
-                "update all: {ok} ok, {fail} failed"
+                "update all: {ok} ok, {fail} failed, {skipped} up to date"
             )));
         });
     }
@@ -714,6 +1307,9 @@ impl eframe::App for MarginaliaApp {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
         self.set_theme(&ctx);
+        if self.view != View::Reader && self.cursor_hidden {
+            self.sync_cursor(&ctx, false);
+        }
 
         // Panel edge lines are drawn with the parent painter, so they ignore
         // the fade below; the manual separator at the end fades instead.
@@ -734,6 +1330,7 @@ impl eframe::App for MarginaliaApp {
                     if self.view == View::Reader {
                         if ui.button("← Library").clicked() {
                             self.close_reader();
+                            self.sync_cursor(ui.ctx(), false);
                         }
                     } else {
                         if ui.button("+ Add").clicked() {
@@ -742,7 +1339,13 @@ impl eframe::App for MarginaliaApp {
                         if ui.button("⤓ Download").clicked() {
                             self.show_download = true;
                         }
-                        if ui.button("↻ Update").clicked() {
+                        // Update buttons hide (rather than disable) when the
+                        // book can't be update-checked.
+                        let fff = fanficfare::is_available();
+                        if fff
+                            && self.selected_book().is_some_and(is_updatable)
+                            && ui.button("↻ Update").clicked()
+                        {
                             if let Some(b) = self.selected_book() {
                                 let id = b.id;
                                 self.start_update_one(id);
@@ -750,10 +1353,21 @@ impl eframe::App for MarginaliaApp {
                                 self.error = Some("no book selected".into());
                             }
                         }
-                        if ui.button("↻ Update all").clicked() {
+                        if fff
+                            && self.tracked_count > 0
+                            && ui
+                                .button(format!(
+                                    "↻ Update all ({} of {})",
+                                    self.tracked_count, self.library_total
+                                ))
+                                .clicked()
+                        {
                             self.start_update_all();
                         }
-                        if !fanficfare::is_available() {
+                        if fff && self.tracked_count > 0 && ui.button("⇪ Check").clicked() {
+                            self.start_check_updates();
+                        }
+                        if !fff {
                             ui.weak("fanficfare missing").on_hover_text(
                                 "Install with `pip install FanFicFare` for download/update",
                             );
@@ -858,8 +1472,9 @@ impl eframe::App for MarginaliaApp {
                 ui.label("Add: import .epub files into the library.");
                 ui.label("Download: fetch a fic URL via fanficfare.");
                 ui.label("Update: refresh selected tracked fic (keeps position).");
-                ui.label("Update all: refresh every tracked fic.");
-                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev and TOC on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
+                ui.label("Update all: refresh every tracked fic (skips books a Check found up to date).");
+                ui.label("Check: poll tracked fics' metadata for new chapters (session-only ⇪ markers).");
+                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev, TOC, and TTS on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
                 if ui.button("Close").clicked() {
                     self.show_help = false;
                 }
@@ -1088,6 +1703,13 @@ impl MarginaliaApp {
                     } else {
                         "—".to_string()
                     };
+                    // Session check results surface here: ⇪ means the last
+                    // metadata check found new chapters ready.
+                    let fic_mark = match self.check_state.get(&book.id) {
+                        Some(fanficfare::CheckState::UpdateAvailable { .. }) => "⇪",
+                        _ if is_updatable(&book) => "✓",
+                        _ => "",
+                    };
                     let cells: [String; 7] = [
                         title,
                         book.authors.clone(),
@@ -1095,11 +1717,7 @@ impl MarginaliaApp {
                         crate::library::human_size(book.file_size),
                         crate::library::human_date(book.added_at),
                         progress,
-                        if book.fanfic_url.is_some() {
-                            "✓".to_string()
-                        } else {
-                            String::new()
-                        },
+                        fic_mark.to_string(),
                     ];
                     for text in cells {
                         row.col(|ui| {
@@ -1178,7 +1796,21 @@ impl MarginaliaApp {
                     book.progress_page
                 ));
                 if let Some(url) = &book.fanfic_url {
-                    ui.hyperlink_to("fic source", url);
+                    if !url.trim().is_empty() {
+                        ui.hyperlink_to("fic source", url);
+                    } else {
+                        ui.weak("not a tracked fic");
+                    }
+                } else {
+                    ui.weak("not a tracked fic");
+                }
+                if let Some(fanficfare::CheckState::UpdateAvailable { new_chapters }) =
+                    self.check_state.get(&book.id)
+                {
+                    ui.label(format!(
+                        "⇪ {new_chapters} new chapter{} ready",
+                        if *new_chapters == 1 { "" } else { "s" }
+                    ));
                 }
             });
         });
@@ -1186,7 +1818,7 @@ impl MarginaliaApp {
             if ui.button("Read").clicked() {
                 self.open_reader(book.id);
             }
-            if ui.button("Update").clicked() {
+            if fanficfare::is_available() && is_updatable(&book) && ui.button("Update").clicked() {
                 self.start_update_one(book.id);
             }
         });
@@ -1266,63 +1898,73 @@ impl MarginaliaApp {
         }
     }
 
-    fn block_text(&self, b: &Block, family: &egui::FontFamily, line_height: f32) -> egui::RichText {
-        // NOTE: headings deliberately do NOT use `.strong()`. egui resolves
-        // "strong" to the *active widget* text color, which themes set for
-        // contrast against accent fills (i.e. near the *background* color) --
-        // on custom themes that made every chapter title invisible.
-        // Headings are distinguished by size instead, so they always resolve
-        // to the normal, readable foreground color.
-        let sized = match b {
-            Block::Heading(1, t) => egui::RichText::new(t).size(self.font_size + 8.0),
-            Block::Heading(_, t) => egui::RichText::new(t).size(self.font_size + 3.0),
-            Block::ListItem(t) => egui::RichText::new(format!("• {t}")).size(self.font_size),
-            Block::Paragraph(t) | Block::Quote(t) | Block::Pre(t) => {
-                egui::RichText::new(t).size(self.font_size)
-            }
-            // Images never reach here (rendered directly); placeholder text.
-            Block::Image { .. } => egui::RichText::new(""),
-        };
-        let styled = match b {
-            Block::Quote(_) => sized.italics(),
-            _ => sized,
-        };
-        styled
-            .family(family.clone())
-            .line_height(Some(line_height))
-            .variation(b"wght", self.block_weight(b))
+    /// Layout job for rendering (theme text color), mirroring measurement.
+    /// NOTE: headings deliberately do NOT use strong styling via widget
+    /// colors; size + weight distinguish them so they stay readable on all
+    /// themes.
+    fn render_job(&self, ui: &egui::Ui, b: &Block, col_w: f32) -> Option<egui::text::LayoutJob> {
+        let visuals = ui.visuals();
+        self.build_job(b, col_w, visuals.text_color(), visuals.code_bg_color)
     }
 
     /// Render a slice of blocks. Returns the clicked image's texture key and
     /// native size, if any, so the caller can open the lightbox.
-    fn render_blocks(&self, ui: &mut egui::Ui, blocks: &[Block]) -> Option<(String, u32, u32)> {
+    /// Text labels are explicitly non-selectable: cross-column drag selection
+    /// is handled by the page-level selection state instead of egui's
+    /// per-label selection, which can't wrap across the column gutter.
+    /// Captured label rects (with `flow_start` as the flow index of
+    /// `blocks[0]` and `col` as the column) feed hit-testing and highlight
+    /// painting.
+    fn render_blocks(
+        &self,
+        ui: &mut egui::Ui,
+        flow_start: usize,
+        blocks: &[Block],
+        out_rects: &mut Vec<SelBlock>,
+        col: u8,
+    ) -> Option<(String, u32, u32)> {
         // No inter-widget spacing: gaps come only from explicit add_space calls
         // so rendered heights match pagination measurements exactly.
         ui.spacing_mut().item_spacing.y = 0.0;
-        let family = self.reader_family();
         let mut opened = None;
         for (i, b) in blocks.iter().enumerate() {
+            let flow_idx = flow_start + i;
             ui.add_space(self.lead_gap(b, i == 0));
             match b {
                 Block::Quote(_) => {
+                    let mut label_rect = None;
+                    // Column width for wrap: captured outside the horizontal so
+                    // measurement (col-12) and rendering agree.
+                    let col_w = ui.available_width().max(80.0);
                     ui.horizontal(|ui| {
                         ui.separator();
                         // Explicit wrap: labels inside a horizontal layout
                         // default to unwrapped single lines, which would blow
                         // out the column width.
-                        ui.add(
-                            egui::Label::new(self.block_text(
-                                b,
-                                &family,
-                                self.block_line_height(b),
-                            ))
-                            .wrap(),
-                        );
+                        if let Some(job) = self.render_job(ui, b, col_w) {
+                            let resp = ui.add(egui::Label::new(job).wrap().selectable(false));
+                            label_rect = Some(resp.rect);
+                        }
                     });
+                    if let Some(rect) = label_rect {
+                        out_rects.push(SelBlock {
+                            flow_idx,
+                            rect,
+                            col,
+                        });
+                    }
                     ui.add_space(self.trail_gap(blocks, i));
                 }
-                Block::Pre(t) => {
-                    ui.code(t);
+                Block::Pre(_) => {
+                    let col_w = ui.available_width().max(80.0);
+                    if let Some(job) = self.render_job(ui, b, col_w) {
+                        let resp = ui.add(egui::Label::new(job).wrap().selectable(false));
+                        out_rects.push(SelBlock {
+                            flow_idx,
+                            rect: resp.rect,
+                            col,
+                        });
+                    }
                     ui.add_space(self.trail_gap(blocks, i));
                 }
                 Block::Image { hash, w, h, .. } => {
@@ -1345,11 +1987,15 @@ impl MarginaliaApp {
                     }
                 }
                 _ => {
-                    ui.add(egui::Label::new(self.block_text(
-                        b,
-                        &family,
-                        self.block_line_height(b),
-                    )));
+                    let col_w = ui.available_width().max(80.0);
+                    if let Some(job) = self.render_job(ui, b, col_w) {
+                        let resp = ui.add(egui::Label::new(job).wrap().selectable(false));
+                        out_rects.push(SelBlock {
+                            flow_idx,
+                            rect: resp.rect,
+                            col,
+                        });
+                    }
                     ui.add_space(self.trail_gap(blocks, i));
                 }
             }
@@ -1416,55 +2062,31 @@ impl MarginaliaApp {
 
     /// Height of one block's label at `width`, without surrounding gaps.
     fn measure_label(&self, ui: &mut egui::Ui, b: &Block, width: f32) -> (f32, usize) {
-        use egui::text::{LayoutJob, TextFormat};
         // Images size by aspect ratio, not by text layout.
         if let Block::Image { w, h, .. } = b {
             return (Self::image_display_size(*w, *h, width).1, 1);
         }
-        let w = match b {
-            // Quotes lose a little width to the separator bar.
-            Block::Quote(_) => (width - 12.0).max(80.0),
-            _ => width,
+        let Some(job) = self.build_job(b, width, egui::Color32::WHITE, egui::Color32::TRANSPARENT)
+        else {
+            return (0.0, 1);
         };
-        let mut format = TextFormat {
-            font_id: egui::FontId::new(self.block_size(b), self.reader_family()),
-            line_height: Some(self.block_line_height(b)),
-            color: egui::Color32::WHITE,
-            coords: egui::epaint::text::VariationCoords::new([(b"wght", self.block_weight(b))]),
-            ..Default::default()
-        };
-        if matches!(b, Block::Quote(_)) {
-            format.italics = true;
-        }
-        let content = match b {
-            Block::Heading(_, t) | Block::Paragraph(t) | Block::Quote(t) | Block::Pre(t) => {
-                t.clone()
-            }
-            Block::ListItem(t) => format!("• {t}"),
-            // Images are measured by aspect ratio above, never as text.
-            Block::Image { .. } => String::new(),
-        };
-        let mut job = LayoutJob::single_section(content, format);
-        job.wrap.max_width = w;
-        job.halign = egui::Align::LEFT;
-        job.justify = false;
         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
         (galley.size().y, galley.rows.len().max(1))
     }
 
-    /// Rebuild a block of the same kind with replacement text (for fragments
+    /// Rebuild a block of the same kind with replacement spans (for fragments
     /// when a paragraph splits across columns/pages).
-    fn with_text(kind: &Block, text: String) -> Block {
+    fn with_spans(kind: &Block, spans: Vec<crate::epub_utils::Span>) -> Block {
         match kind {
-            Block::Paragraph(_) => Block::Paragraph(text),
-            Block::Quote(_) => Block::Quote(text),
-            Block::ListItem(_) => Block::ListItem(text),
-            Block::Pre(_) => Block::Pre(text),
-            Block::Heading(n, _) => Block::Heading(*n, text),
+            Block::Paragraph(_) => Block::Paragraph(spans),
+            Block::Quote(_) => Block::Quote(spans),
+            Block::ListItem(_) => Block::ListItem(spans),
+            Block::Heading(n, _) => Block::Heading(*n, spans),
+            Block::Pre(_) => Block::Pre(spans_plain(&spans)),
             // Images are never split; this arm is unreachable (see
             // `split_for_height`) and only exists for exhaustiveness.
             Block::Image { .. } => Block::Image {
-                bytes: text.into_bytes(),
+                bytes: vec![],
                 alt: String::new(),
                 hash: 0,
                 w: 0,
@@ -1483,12 +2105,43 @@ impl MarginaliaApp {
         col_w: f32,
         max_label_h: f32,
     ) -> Option<(Block, Block)> {
-        let text = match b {
-            Block::Paragraph(t) | Block::Quote(t) | Block::ListItem(t) | Block::Pre(t) => t,
-            // Images (and headings) are never split across pages.
-            Block::Heading(_, _) | Block::Image { .. } => return None,
+        // Images (and headings) are never split across pages.
+        if matches!(b, Block::Heading(_, _) | Block::Image { .. }) {
+            return None;
+        }
+        // Pre blocks split on plain text; rich blocks split span-aware.
+        if let Block::Pre(t) = b {
+            if t.trim().is_empty() {
+                return None;
+            }
+            let (full_h, full_rows) = self.measure_label(ui, b, col_w);
+            let row_h = full_h / full_rows.max(1) as f32;
+            if max_label_h < row_h {
+                return None;
+            }
+            let chars_per_row = (t.chars().count() / full_rows.max(1)).max(1);
+            let mut est = (((max_label_h / row_h).floor() as usize).max(1) * chars_per_row).max(16);
+            for _ in 0..6 {
+                let chunks = epub_utils::chunk_text(t, est);
+                if chunks.len() < 2 {
+                    est = (est / 2).max(16);
+                    continue;
+                }
+                let head = Block::Pre(chunks[0].clone());
+                let tail = Block::Pre(chunks[1..].join(" "));
+                let (hh, _) = self.measure_label(ui, &head, col_w);
+                if hh <= max_label_h {
+                    return Some((head, tail));
+                }
+                est = ((est as f32 * max_label_h / hh) as usize).max(16);
+            }
+            return None;
+        }
+        let spans = match b {
+            Block::Paragraph(s) | Block::Quote(s) | Block::ListItem(s) => s,
+            Block::Heading(_, _) | Block::Image { .. } | Block::Pre(_) => return None,
         };
-        if text.trim().is_empty() {
+        if spans_plain(spans).trim().is_empty() {
             return None;
         }
         let (full_h, full_rows) = self.measure_label(ui, b, col_w);
@@ -1496,16 +2149,44 @@ impl MarginaliaApp {
         if max_label_h < row_h {
             return None;
         }
-        let chars_per_row = (text.chars().count() / full_rows.max(1)).max(1);
+        let total_chars: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+        let chars_per_row = (total_chars / full_rows.max(1)).max(1);
         let mut est = (((max_label_h / row_h).floor() as usize).max(1) * chars_per_row).max(16);
         for _ in 0..6 {
-            let chunks = epub_utils::chunk_text(text, est);
+            let chunks = epub_utils::chunk_spans(spans, est);
             if chunks.len() < 2 {
                 est = (est / 2).max(16);
                 continue;
             }
-            let head = Self::with_text(b, chunks[0].clone());
-            let tail = Self::with_text(b, chunks[1..].join(" "));
+            let head = Self::with_spans(b, chunks[0].clone());
+            // Remaining chunks rejoin with a space so words stay intact.
+            let mut tail_spans: Vec<crate::epub_utils::Span> = Vec::new();
+            for (ci, ch) in chunks[1..].iter().enumerate() {
+                if ci > 0 {
+                    // Separator inherits the preceding style when possible.
+                    let style = tail_spans
+                        .last()
+                        .map(|s: &crate::epub_utils::Span| crate::epub_utils::Span {
+                            text: String::new(),
+                            bold: s.bold,
+                            italic: s.italic,
+                            strike: s.strike,
+                            underline: s.underline,
+                            mono: s.mono,
+                        })
+                        .unwrap_or_default();
+                    tail_spans.push(crate::epub_utils::Span {
+                        text: " ".to_string(),
+                        bold: style.bold,
+                        italic: style.italic,
+                        strike: style.strike,
+                        underline: style.underline,
+                        mono: style.mono,
+                    });
+                }
+                tail_spans.extend(ch.clone());
+            }
+            let tail = Self::with_spans(b, tail_spans);
             let (hh, _) = self.measure_label(ui, &head, col_w);
             if hh <= max_label_h {
                 return Some((head, tail));
@@ -1525,13 +2206,13 @@ impl MarginaliaApp {
         page_h: f32,
         two_col: bool,
     ) -> (Vec<Block>, Vec<PageDef>) {
-        let mut flow = vec![Block::Heading(1, heading.to_string())];
+        let mut flow = vec![Block::Heading(1, plain_spans(heading))];
         flow.extend(blocks.iter().cloned());
         // If the chapter opens with the same heading (common: the TOC label
         // duplicates the in-body h1/h2), drop the duplicate so the title
         // doesn't render twice.
-        if let Some(Block::Heading(_, t)) = flow.get(1) {
-            if t.trim() == heading.trim() {
+        if let Some(Block::Heading(_, spans)) = flow.get(1) {
+            if spans_plain(spans).trim() == heading.trim() {
                 flow.remove(1);
             }
         }
@@ -1641,6 +2322,7 @@ impl MarginaliaApp {
 
     fn ui_reader(&mut self, ui: &mut egui::Ui) {
         let Some(book) = self.reader_book.clone() else {
+            self.sync_cursor(ui.ctx(), false);
             self.view = View::Library;
             return;
         };
@@ -1665,6 +2347,9 @@ impl MarginaliaApp {
         }
         let idle = (now - self.last_activity).as_secs_f32();
         let target = if idle < FADE_DELAY { 1.0 } else { 0.0 };
+        // Cursor follows the same target as the chrome: hidden as soon as
+        // the fade starts, shown whenever the hide is suppressed.
+        self.sync_cursor(ui.ctx(), target == 0.0);
         if self.chrome_opacity != target {
             let dt = ui.ctx().input(|i| i.unstable_dt).clamp(0.0, 0.1);
             let step = dt * 2.5;
@@ -1689,11 +2374,16 @@ impl MarginaliaApp {
         //   Esc: close the image lightbox (and swallow nav keys while it is
         //   open, so pages don't turn behind the overlay).
         let mut close_lightbox = false;
+        let mut clear_sel = false;
         let lightbox_open = self.lightbox.is_some();
         if !ui.ctx().text_edit_focused() {
             ui.ctx().input_mut(|i| {
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                    close_lightbox = true;
+                    if lightbox_open {
+                        close_lightbox = true;
+                    } else {
+                        clear_sel = true;
+                    }
                     return;
                 }
                 if lightbox_open {
@@ -1732,6 +2422,9 @@ impl MarginaliaApp {
             self.lightbox = None;
             self.lightbox_new = false;
         }
+        if clear_sel {
+            self.clear_selection();
+        }
 
         let total_pages = self.pages.len().max(1);
         // NB: `page` can transiently hold the end-of-previous-chapter sentinel
@@ -1767,22 +2460,26 @@ impl MarginaliaApp {
                         {
                             self.toc_open = !self.toc_open;
                         }
+                        if ui
+                            .button(if self.reading_aloud {
+                                "TTS ■"
+                            } else {
+                                "TTS ▶"
+                            })
+                            .on_hover_text("read aloud (R)")
+                            .clicked()
+                        {
+                            if self.reading_aloud {
+                                self.stop_reading();
+                            } else {
+                                self.start_reading();
+                            }
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.scope(|ui| {
                             if faded {
                                 ui.disable();
-                            }
-                            if ui
-                                .button(if self.reading_aloud { "Stop" } else { "Read" })
-                                .on_hover_text("read aloud (R)")
-                                .clicked()
-                            {
-                                if self.reading_aloud {
-                                    self.stop_reading();
-                                } else {
-                                    self.start_reading();
-                                }
                             }
                             if ui.button("Next ›").clicked() {
                                 self.user_next_page();
@@ -1870,6 +2567,8 @@ impl MarginaliaApp {
                     self.flow = flow;
                     self.pages = pages;
                     self.pages_key = Some(key);
+                    // Flow indices shift when splits insert fragments.
+                    self.clear_selection();
                 }
             }
             // Deferred read-aloud start (chapter spill or pre-build Read).
@@ -1925,6 +2624,52 @@ impl MarginaliaApp {
                 }
             }
             let pad = ((avail - render_content_w) / 2.0).max(0.0);
+            // Cross-column drag selection, driven by the previous frame's
+            // block rects (fresh rects are captured during render below).
+            // Column-aware hit-testing snaps at the gutter midpoint, so a
+            // drag from the bottom of the left column continues at whatever
+            // height the pointer enters the right column.
+            let selecting_enabled = self.lightbox.is_none() && !ui.ctx().text_edit_focused();
+            let pointer_pos = ui.ctx().pointer_interact_pos();
+            if selecting_enabled {
+                let (pressed, down, released) = ui.ctx().input(|i| {
+                    (
+                        i.pointer.primary_pressed(),
+                        i.pointer.primary_down(),
+                        i.pointer.primary_released(),
+                    )
+                });
+                if pressed {
+                    if let Some(pos) = pointer_pos {
+                        if self.pointer_in_text(pos) {
+                            let col_w = self.sel_col_w;
+                            if let Some(hit) = self.hit_test(ui, pos, col_w) {
+                                self.sel_anchor = Some(hit);
+                                self.sel_active = Some(hit);
+                                self.sel_dragging = true;
+                            }
+                        } else {
+                            // Click off the text dismisses the selection.
+                            self.clear_selection();
+                        }
+                    }
+                } else if self.sel_dragging && down {
+                    if let Some(pos) = pointer_pos {
+                        let col_w = self.sel_col_w;
+                        if let Some(hit) = self.hit_test(ui, pos, col_w) {
+                            self.sel_active = Some(hit);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+                if released && self.sel_dragging {
+                    self.sel_dragging = false;
+                    if self.sel_anchor == self.sel_active {
+                        self.clear_selection();
+                    }
+                }
+            }
+            let mut new_rects: Vec<SelBlock> = Vec::new();
             ui.horizontal(|ui| {
                 if pad > 1.0 {
                     ui.add_space(pad);
@@ -1944,7 +2689,9 @@ impl MarginaliaApp {
                             ui.vertical(|ui| {
                                 ui.set_width(render_col_w);
                                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                    if let Some(o) = self.render_blocks(ui, left) {
+                                    if let Some(o) =
+                                        self.render_blocks(ui, pg.start, left, &mut new_rects, 0)
+                                    {
                                         open_img = Some(o);
                                     }
                                 });
@@ -1953,7 +2700,9 @@ impl MarginaliaApp {
                             ui.vertical(|ui| {
                                 ui.set_width(render_col_w);
                                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                    if let Some(o) = self.render_blocks(ui, right) {
+                                    if let Some(o) =
+                                        self.render_blocks(ui, mid, right, &mut new_rects, 1)
+                                    {
                                         open_img = Some(o);
                                     }
                                 });
@@ -1967,9 +2716,13 @@ impl MarginaliaApp {
                             });
                             self.lightbox_new = true;
                         }
-                    } else if let Some((key, w, h)) =
-                        self.render_blocks(ui, &self.flow[pg.start..pg.end])
-                    {
+                    } else if let Some((key, w, h)) = self.render_blocks(
+                        ui,
+                        pg.start,
+                        &self.flow[pg.start..pg.end],
+                        &mut new_rects,
+                        0,
+                    ) {
                         self.lightbox = Some(Lightbox {
                             tex_key: key,
                             native_w: w,
@@ -1979,6 +2732,58 @@ impl MarginaliaApp {
                     }
                 });
             });
+            self.sel_rects = new_rects;
+            self.sel_col_w = render_col_w;
+            // Selection highlight: painted after the text with a translucent
+            // fill so glyphs stay legible.
+            self.paint_selection(ui, &self.sel_rects.clone(), render_col_w);
+            if selecting_enabled {
+                if let Some(pos) = pointer_pos {
+                    if self.pointer_in_text(pos) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                }
+                // Cmd/Ctrl+C copies the selection (egui also emits
+                // `Event::Copy` on some backends).
+                let want_copy = ui.ctx().input_mut(|i| {
+                    let key_copy = i.consume_key(egui::Modifiers::COMMAND, egui::Key::C);
+                    let event_copy = i
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+                    key_copy || event_copy
+                });
+                if want_copy {
+                    let text = self.selection_text();
+                    if !text.is_empty() {
+                        ui.ctx().copy_text(text);
+                    }
+                }
+                // Right-click menu with a Copy item, attached to a hover
+                // overlay so it never steals clicks from images.
+                if self.ordered_selection().is_some() {
+                    let union = self
+                        .sel_rects
+                        .iter()
+                        .fold(egui::Rect::NOTHING, |r, b| r.union(b.rect));
+                    if union.is_positive() {
+                        let bg = ui.interact(
+                            union,
+                            egui::Id::unique("reader-sel-bg"),
+                            egui::Sense::hover(),
+                        );
+                        bg.context_menu(|ui| {
+                            if ui.button("Copy").clicked() {
+                                let text = self.selection_text();
+                                if !text.is_empty() {
+                                    ui.ctx().copy_text(text);
+                                }
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            }
         });
         self.show_lightbox(ui.ctx());
     }
@@ -2093,6 +2898,9 @@ mod tests {
         MarginaliaApp {
             lib,
             books: vec![],
+            tracked_count: 0,
+            library_total: 0,
+            check_state: HashMap::new(),
             query: String::new(),
             search_id: egui::Id::unique("library-search"),
             sort: SortKey::Recent,
@@ -2121,8 +2929,14 @@ mod tests {
             last_geom_change: std::time::Instant::now(),
             built_two_col: false,
             chrome_opacity: 1.0,
+            cursor_hidden: false,
             lightbox: None,
             lightbox_new: false,
+            sel_anchor: None,
+            sel_active: None,
+            sel_dragging: false,
+            sel_rects: Vec::new(),
+            sel_col_w: 0.0,
             textures: HashMap::new(),
             tx,
             rx,
@@ -2146,7 +2960,10 @@ mod tests {
         blocks
             .iter()
             .flat_map(|b| match b {
-                Block::Paragraph(t) => t.split_whitespace().map(str::to_string).collect(),
+                Block::Paragraph(s) => spans_plain(s)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
                 _ => Vec::new(),
             })
             .collect()
@@ -2172,9 +2989,9 @@ mod tests {
 
     fn long_chapter() -> Vec<Block> {
         vec![
-            Block::Paragraph(("First paragraph. ".repeat(120)).trim().to_string()),
-            Block::Paragraph(("Second paragraph. ".repeat(120)).trim().to_string()),
-            Block::Paragraph(("Third paragraph. ".repeat(120)).trim().to_string()),
+            Block::Paragraph(plain_spans(("First paragraph. ".repeat(120)).trim())),
+            Block::Paragraph(plain_spans(("Second paragraph. ".repeat(120)).trim())),
+            Block::Paragraph(plain_spans(("Third paragraph. ".repeat(120)).trim())),
         ]
     }
 
@@ -2220,11 +3037,11 @@ mod tests {
     fn no_stranded_headings() {
         let app = fixture_app();
         let blocks = vec![
-            Block::Paragraph(("Intro. ".repeat(60)).trim().to_string()),
-            Block::Heading(2, "Section".to_string()),
-            Block::Paragraph(("Body. ".repeat(200)).trim().to_string()),
-            Block::Heading(2, "Another".to_string()),
-            Block::Paragraph(("Tail. ".repeat(200)).trim().to_string()),
+            Block::Paragraph(plain_spans(("Intro. ".repeat(60)).trim())),
+            Block::Heading(2, plain_spans("Section")),
+            Block::Paragraph(plain_spans(("Body. ".repeat(200)).trim())),
+            Block::Heading(2, plain_spans("Another")),
+            Block::Paragraph(plain_spans(("Tail. ".repeat(200)).trim())),
         ];
         for two_col in [false, true] {
             let (flow, pages) = paginate_case(&app, &blocks, 500.0, 420.0, two_col);
@@ -2273,7 +3090,8 @@ mod tests {
             ui.vertical(|ui| {
                 ui.set_width(col_w);
                 let y0 = ui.cursor().top();
-                app.render_blocks(ui, blocks);
+                let mut rects = Vec::new();
+                app.render_blocks(ui, 0, blocks, &mut rects, 0);
                 advance.set(ui.cursor().top() - y0);
             });
         });
@@ -2285,7 +3103,7 @@ mod tests {
     fn quote_blocks_wrap_within_the_column() {
         let mut app = fixture_app();
         // Long enough to wrap several times at 400pt with a 16pt font.
-        let blocks = vec![Block::Quote("word ".repeat(200).trim().to_string())];
+        let blocks = vec![Block::Quote(plain_spans("word ".repeat(200).trim()))];
         let col_w = 400.0;
         let ctx = egui::Context::default();
         fonts::install(&ctx);
@@ -2360,9 +3178,9 @@ mod tests {
         let mut app = fixture_app();
         // 300x100 native at a 400pt column: no upscale, so 300x100.
         let blocks = vec![
-            Block::Paragraph("Intro.".to_string()),
+            Block::Paragraph(plain_spans("Intro.")),
             image_block_for_test(300, 100),
-            Block::Paragraph("Outro.".to_string()),
+            Block::Paragraph(plain_spans("Outro.")),
         ];
         let col_w = 400.0;
         // Direct check: the image block measures to its display size.
@@ -2387,11 +3205,11 @@ mod tests {
         let rendered = rendered_height(&mut app, &blocks, col_w);
         let para_expected = rendered_height(
             &mut fixture_app(),
-            &[Block::Paragraph("Intro.".to_string())],
+            &[Block::Paragraph(plain_spans("Intro."))],
             col_w,
         ) + rendered_height(
             &mut fixture_app(),
-            &[Block::Paragraph("Outro.".to_string())],
+            &[Block::Paragraph(plain_spans("Outro."))],
             col_w,
         );
         // Paragraph heights are deterministic for the same text/width, so the
@@ -2407,21 +3225,13 @@ mod tests {
     fn headings_resolve_to_visible_colors_on_every_theme() {
         use crate::themes::ThemeId;
         let app = fixture_app();
-        let family = app.reader_family();
         for t in ThemeId::all() {
             let visuals = t.visuals();
-            let style = egui::Style {
-                visuals: visuals.clone(),
-                ..Default::default()
-            };
             for level in [1u8, 2] {
-                let b = Block::Heading(level, "Chapter Title".to_string());
-                let rt = app.block_text(&b, &family, app.block_line_height(&b));
-                let job = egui::WidgetText::RichText(rt.into()).into_layout_job(
-                    &style,
-                    egui::FontSelection::Default,
-                    egui::Align::LEFT,
-                );
+                let b = Block::Heading(level, plain_spans("Chapter Title"));
+                // Build via build_job with the theme's text color.
+                let job = app.build_job(&b, 500.0, visuals.text_color(), visuals.code_bg_color);
+                let job = job.expect("heading job");
                 assert!(!job.sections.is_empty(), "{}", t.id());
                 // A heading painted in the panel background color is invisible.
                 // (Regression test: `.strong()` resolved to the active-widget
@@ -2439,11 +3249,11 @@ mod tests {
         // TOC label "Chapter" matches the in-body h2: the title must appear
         // exactly once at the top of the flow, not twice.
         let blocks = vec![
-            Block::Heading(2, "Chapter".to_string()),
-            Block::Paragraph("Body text here.".to_string()),
+            Block::Heading(2, plain_spans("Chapter")),
+            Block::Paragraph(plain_spans("Body text here.")),
         ];
         let (flow, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
-        assert!(matches!(&flow[0], Block::Heading(1, t) if t == "Chapter"));
+        assert!(matches!(&flow[0], Block::Heading(1, t) if spans_plain(t) == "Chapter"));
         assert!(matches!(&flow[1], Block::Paragraph(_)));
     }
 
@@ -2451,12 +3261,12 @@ mod tests {
     fn distinct_in_body_heading_is_kept() {
         let app = fixture_app();
         let blocks = vec![
-            Block::Heading(2, "A Section Inside".to_string()),
-            Block::Paragraph("Body text here.".to_string()),
+            Block::Heading(2, plain_spans("A Section Inside")),
+            Block::Paragraph(plain_spans("Body text here.")),
         ];
         let (flow, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
-        assert!(matches!(&flow[0], Block::Heading(1, t) if t == "Chapter"));
-        assert!(matches!(&flow[1], Block::Heading(2, t) if t == "A Section Inside"));
+        assert!(matches!(&flow[0], Block::Heading(1, t) if spans_plain(t) == "Chapter"));
+        assert!(matches!(&flow[1], Block::Heading(2, t) if spans_plain(t) == "A Section Inside"));
     }
 
     fn reading_app() -> MarginaliaApp {
@@ -2489,8 +3299,8 @@ mod tests {
                 index: i,
                 label: format!("Chapter {}", i + 1),
                 blocks: vec![
-                    Block::Paragraph(("Some body text here. ".repeat(120)).trim().to_string()),
-                    Block::Paragraph(("More body text here. ".repeat(120)).trim().to_string()),
+                    Block::Paragraph(plain_spans(("Some body text here. ".repeat(120)).trim())),
+                    Block::Paragraph(plain_spans(("More body text here. ".repeat(120)).trim())),
                 ],
             })
             .collect();
@@ -2628,7 +3438,7 @@ mod tests {
         // A tiny chapter fits in one column (split None); the renderer still
         // draws both columns, leaving the second empty.
         let app = fixture_app();
-        let blocks = vec![Block::Paragraph("Tiny.".to_string())];
+        let blocks = vec![Block::Paragraph(plain_spans("Tiny."))];
         let (flow, pages) = paginate_case(&app, &blocks, 350.0, 400.0, true);
         assert_eq!(pages.len(), 1);
         assert!(pages[0].split.is_none());
@@ -2685,5 +3495,106 @@ mod tests {
         assert!(!is_page_turn_key(egui::Key::Enter));
         // Tab toggles the TOC panel, so it counts as chrome interaction.
         assert!(!is_page_turn_key(egui::Key::Tab));
+    }
+
+    #[test]
+    fn slice_chars_handles_multi_byte_and_clamps() {
+        assert_eq!(slice_chars("héllo", 1, 3), "él");
+        // Reversed and out-of-range endpoints clamp instead of panicking.
+        assert_eq!(slice_chars("abc", 2, 0), "ab");
+        assert_eq!(slice_chars("abc", 0, 99), "abc");
+        assert_eq!(slice_chars("", 0, 5), "");
+    }
+
+    #[test]
+    fn list_bullet_prefix_never_reaches_clipboard() {
+        let b = Block::ListItem(plain_spans("second item"));
+        // Layout text carries the bullet; copy strips it.
+        assert_eq!(MarginaliaApp::layout_text_of(&b), "• second item");
+        assert_eq!(MarginaliaApp::copy_slice_of(&b, 0, 13), "second item");
+        // A range covering only the bullet copies nothing.
+        assert_eq!(MarginaliaApp::copy_slice_of(&b, 0, 2), "");
+    }
+
+    fn selection_fixture() -> MarginaliaApp {
+        let mut app = fixture_app();
+        app.flow = vec![
+            Block::Paragraph(plain_spans("First block here.")),
+            Block::Paragraph(plain_spans("Second block here.")),
+            Block::Image {
+                bytes: vec![],
+                alt: "alt".to_string(),
+                hash: 1,
+                w: 10,
+                h: 10,
+            },
+            Block::ListItem(plain_spans("third item")),
+        ];
+        app
+    }
+
+    #[test]
+    fn selection_text_spans_blocks_and_skips_images() {
+        let mut app = selection_fixture();
+        // Whole first block plus a slice of the second.
+        app.sel_anchor = Some((0, 0));
+        app.sel_active = Some((1, 6));
+        assert_eq!(app.selection_text(), "First block here.\n\nSecond");
+        // Reversed endpoints order the same way.
+        app.sel_anchor = Some((1, 6));
+        app.sel_active = Some((0, 0));
+        assert_eq!(app.selection_text(), "First block here.\n\nSecond");
+        // Images contribute no text; the list bullet is stripped.
+        app.sel_anchor = Some((1, 0));
+        app.sel_active = Some((3, 12));
+        assert_eq!(app.selection_text(), "Second block here.\n\nthird item");
+        // Empty (tap without drag) selects nothing.
+        app.sel_anchor = Some((1, 4));
+        app.sel_active = Some((1, 4));
+        assert_eq!(app.selection_text(), "");
+    }
+
+    #[test]
+    fn navigation_clears_selection() {
+        let mut app = selection_fixture();
+        app.sel_anchor = Some((0, 0));
+        app.sel_active = Some((1, 3));
+        app.sel_dragging = true;
+        app.clear_selection();
+        assert!(app.ordered_selection().is_none());
+        assert!(!app.sel_dragging);
+    }
+
+    #[test]
+    fn updatable_requires_nonempty_fanfic_url() {
+        fn book_with(url: Option<&str>) -> Book {
+            Book {
+                id: 1,
+                hash: "abc".to_string(),
+                short_id: "abc".to_string(),
+                title: "T".to_string(),
+                authors: "A".to_string(),
+                series: String::new(),
+                series_index: None,
+                publisher: String::new(),
+                published: String::new(),
+                language: "en".to_string(),
+                subjects: String::new(),
+                description: String::new(),
+                fanfic_url: url.map(str::to_string),
+                file_path: "books/A/T/book.epub".to_string(),
+                file_size: 1,
+                added_at: 0,
+                opened_at: 0,
+                progress_chapter: 0,
+                progress_page: 0,
+            }
+        }
+        assert!(is_updatable(&book_with(Some(
+            "https://archiveofourown.org/works/1"
+        ))));
+        assert!(!is_updatable(&book_with(None)));
+        assert!(!is_updatable(&book_with(Some(""))));
+        assert!(!is_updatable(&book_with(Some("   "))));
     }
 }
