@@ -166,6 +166,12 @@ pub struct MarginaliaApp {
     sort: SortKey,
     sort_reverse: bool,
     selected: Option<i64>,
+    /// Select mode for batch operations: checked book ids (stable across
+    /// sort/search/refresh). Cleared when leaving select mode.
+    select_mode: bool,
+    checked: std::collections::HashSet<i64>,
+    /// Pending delete confirmation: (id, title) pairs awaiting Confirm.
+    delete_confirm: Option<Vec<(i64, String)>>,
     view: View,
     reader_book: Option<Book>,
     toc: Vec<TocEntry>,
@@ -258,6 +264,9 @@ impl MarginaliaApp {
             sort: SortKey::Recent,
             sort_reverse: false,
             selected: None,
+            select_mode: false,
+            checked: std::collections::HashSet::new(),
+            delete_confirm: None,
             view: View::Library,
             reader_book: None,
             toc: vec![],
@@ -1319,20 +1328,160 @@ impl MarginaliaApp {
             self.error = Some("no FanFicFare-tracked books.".into());
             return;
         }
-        // Skip books a session check already proved up to date.
-        let skip: Vec<i64> = tracked
+        let ids: Vec<(i64, String)> = tracked.into_iter().map(|b| (b.id, b.title)).collect();
+        self.start_update_ids(ids, "tracked fics");
+    }
+
+    /// Whether every book in the current (possibly filtered) view is checked.
+    fn visible_all_checked(&self) -> bool {
+        !self.books.is_empty() && self.books.iter().all(|b| self.checked.contains(&b.id))
+    }
+
+    /// Check or uncheck every book in the current view. Checked ids outside
+    /// the view are left alone.
+    fn set_visible_checked(&mut self, on: bool) {
+        if on {
+            self.checked.extend(self.books.iter().map(|b| b.id));
+        } else {
+            let ids: Vec<i64> = self.books.iter().map(|b| b.id).collect();
+            for id in ids {
+                self.checked.remove(&id);
+            }
+        }
+    }
+
+    /// Checked books resolved to (id, title) for updating, plus the count of
+    /// checked books that aren't update-eligible.
+    fn checked_updatable(&self) -> (Vec<(i64, String)>, usize) {
+        let mut ids = Vec::new();
+        let mut ineligible = 0;
+        for id in &self.checked {
+            match self.lib.get_by_id(*id).ok().flatten() {
+                Some(b) if is_updatable(&b) => ids.push((b.id, b.title)),
+                _ => ineligible += 1,
+            }
+        }
+        (ids, ineligible)
+    }
+
+    /// Remove deleted ids from every piece of UI state.
+    fn prune_deleted(&mut self, ids: &[i64]) {
+        for id in ids {
+            self.checked.remove(id);
+            self.check_state.remove(id);
+            self.textures.remove(&format!("cover-{id}"));
+        }
+        if self.selected.is_some_and(|s| ids.contains(&s)) {
+            self.selected = None;
+        }
+    }
+
+    /// Update the checked books (select mode). Only FanFicFare-tracked
+    /// checked books are eligible; anything else is reported, not run.
+    fn start_update_selected(&mut self) {
+        if !fanficfare::is_available() {
+            self.error = Some("fanficfare not found on PATH.".into());
+            return;
+        }
+        let (ids, ineligible) = self.checked_updatable();
+        if ids.is_empty() {
+            self.error = Some("no updatable fics selected".into());
+            return;
+        }
+        let note = if ineligible > 0 {
+            format!("selected fics ({ineligible} not tracked)")
+        } else {
+            "selected fics".to_string()
+        };
+        self.start_update_ids(ids, &note);
+    }
+
+    /// Stage a delete confirmation for the checked books (select mode).
+    fn ask_delete_checked(&mut self) {
+        let mut ids: Vec<(i64, String)> = self
+            .books
             .iter()
-            .filter(|b| self.check_state.get(&b.id) == Some(&fanficfare::CheckState::UpToDate))
-            .map(|b| b.id)
+            .filter(|b| self.checked.contains(&b.id))
+            .map(|b| (b.id, b.title.clone()))
             .collect();
-        if skip.len() == tracked.len() {
-            self.jobs.push("all tracked fics up to date".to_string());
+        // Checked ids outside the current filter still count.
+        for id in &self.checked {
+            if !ids.iter().any(|(i, _)| i == id) {
+                let title = self
+                    .lib
+                    .get_by_id(*id)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.title)
+                    .unwrap_or_else(|| format!("book {id}"));
+                ids.push((*id, title));
+            }
+        }
+        if ids.is_empty() {
+            self.delete_confirm = None;
+            self.error = Some("no books selected".into());
+            return;
+        }
+        ids.sort_by(|a, b| a.1.cmp(&b.1));
+        self.delete_confirm = Some(ids);
+    }
+
+    /// Stage a delete confirmation for one book (details pane).
+    fn ask_delete_one(&mut self, id: i64) {
+        let title = self
+            .selected_book()
+            .filter(|b| b.id == id)
+            .map(|b| b.title.clone())
+            .or_else(|| self.lib.get_by_id(id).ok().flatten().map(|b| b.title))
+            .unwrap_or_else(|| format!("book {id}"));
+        self.delete_confirm = Some(vec![(id, title)]);
+    }
+
+    /// Delete the confirmed books: DB rows, files, and all UI state.
+    fn do_delete_books(&mut self, ids: &[i64]) {
+        if ids.is_empty() {
+            self.delete_confirm = None;
+            return;
+        }
+        // Close the reader first if its book is going away.
+        if self
+            .reader_book
+            .as_ref()
+            .is_some_and(|b| ids.contains(&b.id))
+        {
+            self.close_reader();
+        }
+        match self.lib.delete_books(ids) {
+            Ok(n) => {
+                self.prune_deleted(ids);
+                self.jobs
+                    .push(format!("deleted {n} book{}", if n == 1 { "" } else { "s" }));
+                self.refresh();
+            }
+            Err(e) => {
+                self.error = Some(format!("delete failed: {e}"));
+            }
+        }
+        self.delete_confirm = None;
+    }
+
+    /// Update an explicit id list on a background thread, skipping books a
+    /// check already proved up to date. `what` names the set for messages.
+    fn start_update_ids(&mut self, ids: Vec<(i64, String)>, what: &str) {
+        // Skip books a session check already proved up to date.
+        let skip: Vec<i64> = ids
+            .iter()
+            .filter(|(id, _)| self.check_state.get(id) == Some(&fanficfare::CheckState::UpToDate))
+            .map(|(id, _)| *id)
+            .collect();
+        if skip.len() == ids.len() {
+            self.jobs.push(format!("all {what} up to date"));
             return;
         }
         self.jobs.busy = true;
         self.jobs.push(format!(
-            "updating {} fics …{}",
-            tracked.len() - skip.len(),
+            "updating {} {what} …{}",
+            ids.len() - skip.len(),
             if skip.is_empty() {
                 String::new()
             } else {
@@ -1341,7 +1490,6 @@ impl MarginaliaApp {
         ));
         let tx = self.tx.clone();
         let root = self.lib.root.clone();
-        let ids: Vec<(i64, String)> = tracked.into_iter().map(|b| (b.id, b.title)).collect();
         std::thread::spawn(move || {
             let lib = match Library::open(root) {
                 Ok(l) => l,
@@ -1398,7 +1546,7 @@ impl MarginaliaApp {
                 let _ = tx.send(JobEvent::CheckDone(fresh));
             }
             let _ = tx.send(JobEvent::Done(format!(
-                "update all: {ok} ok, {fail} failed, {skipped} up to date"
+                "update: {ok} ok, {fail} failed, {skipped} up to date"
             )));
         });
     }
@@ -1456,30 +1604,65 @@ impl eframe::App for MarginaliaApp {
                         if ui.button("⤓ Download").clicked() {
                             self.show_download = true;
                         }
+                        if ui
+                            .selectable_label(self.select_mode, "☑ Select")
+                            .on_hover_text("select mode: check fics for batch update/delete")
+                            .clicked()
+                        {
+                            self.select_mode = !self.select_mode;
+                            if !self.select_mode {
+                                self.checked.clear();
+                                self.delete_confirm = None;
+                            }
+                        }
                         // Update buttons hide (rather than disable) when the
                         // book can't be update-checked.
                         let fff = fanficfare::is_available();
-                        if fff
-                            && self.selected_book().is_some_and(is_updatable)
-                            && ui.button("↻ Update").clicked()
-                        {
-                            if let Some(b) = self.selected_book() {
-                                let id = b.id;
-                                self.start_update_one(id);
-                            } else {
-                                self.error = Some("no book selected".into());
+                        if self.select_mode {
+                            let n = self.checked.len();
+                            if fff
+                                && self.tracked_count > 0
+                                && ui
+                                    .add_enabled(
+                                        n > 0,
+                                        egui::Button::new(format!("↻ Update selected ({n})")),
+                                    )
+                                    .clicked()
+                            {
+                                self.start_update_selected();
                             }
-                        }
-                        if fff
-                            && self.tracked_count > 0
-                            && ui
-                                .button(format!(
-                                    "↻ Update all ({} of {})",
-                                    self.tracked_count, self.library_total
-                                ))
+                            if ui
+                                .add_enabled(
+                                    n > 0,
+                                    egui::Button::new(format!("🗑 Delete selected ({n})")),
+                                )
                                 .clicked()
-                        {
-                            self.start_update_all();
+                            {
+                                self.ask_delete_checked();
+                            }
+                        } else {
+                            if fff
+                                && self.selected_book().is_some_and(is_updatable)
+                                && ui.button("↻ Update").clicked()
+                            {
+                                if let Some(b) = self.selected_book() {
+                                    let id = b.id;
+                                    self.start_update_one(id);
+                                } else {
+                                    self.error = Some("no book selected".into());
+                                }
+                            }
+                            if fff
+                                && self.tracked_count > 0
+                                && ui
+                                    .button(format!(
+                                        "↻ Update all ({} of {})",
+                                        self.tracked_count, self.library_total
+                                    ))
+                                    .clicked()
+                            {
+                                self.start_update_all();
+                            }
                         }
                         if fff && self.tracked_count > 0 && ui.button("⇪ Check").clicked() {
                             self.start_check_updates();
@@ -1581,6 +1764,43 @@ impl eframe::App for MarginaliaApp {
                 });
         }
 
+        if self.delete_confirm.is_some() {
+            // Staged ids are cloned out so the dialog can mutate state.
+            let pending = self.delete_confirm.clone().unwrap_or_default();
+            let mut close = false;
+            let mut confirm = false;
+            egui::Window::new("Delete fics")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .show(&ctx, |ui| {
+                    ui.label(format!(
+                        "Remove {} book{} from the library? Files are deleted.",
+                        pending.len(),
+                        if pending.len() == 1 { "" } else { "s" }
+                    ));
+                    for (_, title) in pending.iter().take(5) {
+                        ui.weak(format!("• {title}"));
+                    }
+                    if pending.len() > 5 {
+                        ui.weak(format!("…and {} more", pending.len() - 5));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if confirm {
+                let ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
+                self.do_delete_books(&ids);
+            } else if close {
+                self.delete_confirm = None;
+            }
+        }
+
         if self.show_help {
             egui::Window::new("Help")
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1591,6 +1811,7 @@ impl eframe::App for MarginaliaApp {
                 ui.label("Update: refresh selected tracked fic (keeps position).");
                 ui.label("Update all: refresh every tracked fic (skips books a Check found up to date).");
                 ui.label("Check: poll tracked fics' metadata for new chapters (session-only ⇪ markers).");
+                ui.label("Select: checkbox mode for batch Update/Delete over checked fics (All selects the filtered view).");
                 ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev, TOC, and TTS on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
                 if ui.button("Close").clicked() {
                     self.show_help = false;
@@ -1694,6 +1915,23 @@ impl MarginaliaApp {
                     self.refresh();
                 }
                 ui.weak(format!("{} books", self.books.len()));
+                if self.select_mode {
+                    if ui.small_button("All").clicked() {
+                        self.set_visible_checked(true);
+                    }
+                    if ui.small_button("None").clicked() {
+                        self.set_visible_checked(false);
+                    }
+                    ui.weak(format!(
+                        "{} selected{}",
+                        self.checked.len(),
+                        if self.visible_all_checked() {
+                            " (all)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
                 ui.label("Double-click a row to read.");
             });
             ui.separator();
@@ -1762,10 +2000,14 @@ impl MarginaliaApp {
         let active_sort = self.sort;
         let active_rev = self.sort_reverse;
 
-        TableBuilder::new(ui)
+        let mut builder = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        if self.select_mode {
+            builder = builder.column(Column::auto().at_least(28.0));
+        }
+        builder
             .column(Column::remainder().at_least(140.0))
             .column(Column::auto().at_least(90.0).resizable(true))
             .column(Column::auto().at_least(80.0).resizable(true))
@@ -1774,6 +2016,18 @@ impl MarginaliaApp {
             .column(Column::auto().at_least(56.0))
             .column(Column::auto().at_least(32.0))
             .header(26.0, |mut header| {
+                if self.select_mode {
+                    header.col(|ui| {
+                        let all = self.visible_all_checked();
+                        if ui
+                            .small_button(if all { "☑" } else { "☐" })
+                            .on_hover_text("select all / none (filtered view)")
+                            .clicked()
+                        {
+                            self.set_visible_checked(!all);
+                        }
+                    });
+                }
                 for (key, name) in [
                     (SortKey::Title, "Title"),
                     (SortKey::Author, "Author"),
@@ -1803,6 +2057,18 @@ impl MarginaliaApp {
                     let sel = self.selected == Some(book.id);
                     row.set_selected(sel);
 
+                    if self.select_mode {
+                        row.col(|ui| {
+                            let mut on = self.checked.contains(&book.id);
+                            if ui.checkbox(&mut on, "").changed() {
+                                if on {
+                                    self.checked.insert(book.id);
+                                } else {
+                                    self.checked.remove(&book.id);
+                                }
+                            }
+                        });
+                    }
                     let series = if book.series.is_empty() {
                         String::new()
                     } else if let Some(n) = book.series_index {
@@ -1937,6 +2203,13 @@ impl MarginaliaApp {
             }
             if fanficfare::is_available() && is_updatable(&book) && ui.button("Update").clicked() {
                 self.start_update_one(book.id);
+            }
+            if ui
+                .button("🗑 Delete")
+                .on_hover_text("remove this book from the library")
+                .clicked()
+            {
+                self.ask_delete_one(book.id);
             }
         });
         ui.separator();
@@ -3023,6 +3296,9 @@ mod tests {
             sort: SortKey::Recent,
             sort_reverse: false,
             selected: None,
+            select_mode: false,
+            checked: std::collections::HashSet::new(),
+            delete_confirm: None,
             view: View::Library,
             reader_book: None,
             toc: vec![],
@@ -3560,6 +3836,91 @@ mod tests {
         assert_eq!(pages.len(), 1);
         assert!(pages[0].split.is_none());
         assert_eq!((pages[0].start, pages[0].end), (0, flow.len()));
+    }
+
+    fn fixture_book(id: i64, title: &str, fanfic_url: Option<&str>) -> Book {
+        Book {
+            id,
+            hash: format!("hash{id}"),
+            short_id: format!("s{id}"),
+            title: title.to_string(),
+            authors: "Author".to_string(),
+            series: String::new(),
+            series_index: None,
+            publisher: String::new(),
+            published: String::new(),
+            language: "en".to_string(),
+            subjects: String::new(),
+            description: String::new(),
+            fanfic_url: fanfic_url.map(str::to_string),
+            file_path: format!("books/Author/{title}/book.epub"),
+            file_size: 1000,
+            added_at: 0,
+            opened_at: 0,
+            progress_chapter: 0,
+            progress_page: 0,
+        }
+    }
+
+    #[test]
+    fn select_all_covers_filtered_view_only() {
+        let mut app = fixture_app();
+        app.select_mode = true;
+        app.books = vec![
+            fixture_book(1, "A", None),
+            fixture_book(2, "B", None),
+            fixture_book(3, "C", None),
+        ];
+        assert!(!app.visible_all_checked());
+        app.set_visible_checked(true);
+        assert!(app.visible_all_checked());
+        assert_eq!(app.checked.len(), 3);
+        // Narrowing the view leaves off-filter ids alone on clear.
+        app.books.retain(|b| b.id != 3);
+        app.set_visible_checked(false);
+        assert_eq!(app.checked, std::collections::HashSet::from([3]));
+        assert!(!app.visible_all_checked());
+    }
+
+    #[test]
+    fn ask_delete_checked_sorts_and_counts_off_filter() {
+        let mut app = fixture_app();
+        app.select_mode = true;
+        app.books = vec![
+            fixture_book(2, "Zulu", None),
+            fixture_book(1, "Alpha", None),
+        ];
+        app.checked = std::collections::HashSet::from([1, 2, 999]);
+        app.ask_delete_checked();
+        let pending = app.delete_confirm.clone().unwrap();
+        assert_eq!(pending.len(), 3);
+        // Sorted by title; unknown off-filter id falls back to a label.
+        assert_eq!(pending[0], (1, "Alpha".to_string()));
+        assert_eq!(pending[1].0, 2);
+        assert_eq!(pending[1].1, "Zulu".to_string());
+        assert!(pending.iter().any(|(id, t)| *id == 999 && t == "book 999"));
+        assert!(pending.iter().any(|(id, t)| *id == 999 && t == "book 999"));
+        // Empty selection errors instead of opening the dialog.
+        app.checked.clear();
+        app.ask_delete_checked();
+        assert!(app.delete_confirm.is_none());
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn prune_deleted_clears_state() {
+        let mut app = fixture_app();
+        app.checked = std::collections::HashSet::from([1, 2]);
+        app.check_state.insert(1, fanficfare::CheckState::UpToDate);
+        app.selected = Some(1);
+        app.prune_deleted(&[1]);
+        assert_eq!(app.checked, std::collections::HashSet::from([2]));
+        assert!(app.check_state.is_empty());
+        assert!(app.selected.is_none());
+        // Untouched ids keep their state.
+        app.selected = Some(2);
+        app.prune_deleted(&[9]);
+        assert_eq!(app.selected, Some(2));
     }
 
     #[test]

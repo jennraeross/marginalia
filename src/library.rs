@@ -347,6 +347,30 @@ impl Library {
         Ok(self.get_by_id(book_id)?.expect("updated"))
     }
 
+    /// Delete books by id: removes the DB rows, cached check rows, and each
+    /// book's directory under `books/` (covers live alongside the EPUB).
+    /// Missing files/dirs are tolerated; unknown ids are ignored.
+    /// Returns the number of books removed.
+    pub fn delete_books(&self, ids: &[i64]) -> AnyhowResult<usize> {
+        let mut removed = 0;
+        for id in ids {
+            let Some(book) = self.get_by_id(*id)? else {
+                continue;
+            };
+            // Safety: only remove directories inside the library's books dir.
+            if let Some(dir) = self.abs_path(&book.file_path).parent() {
+                if dir.starts_with(self.books_dir()) {
+                    let _ = fs::remove_dir_all(dir);
+                }
+            }
+            let conn = self.connect()?;
+            conn.execute("DELETE FROM books WHERE id = ?1", params![id])?;
+            conn.execute("DELETE FROM update_checks WHERE book_id = ?1", params![id])?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     pub fn find_by_hash(&self, hash: &str) -> AnyhowResult<Option<Book>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT * FROM books WHERE hash = ?1")?;
@@ -894,5 +918,67 @@ mod tests {
         assert_eq!(remote, None);
         // Other books are independent.
         assert_eq!(lib.get_check(43).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_books_removes_rows_dirs_and_checks() {
+        fn fixture_epub(path: &std::path::Path, title: &str, author: &str) {
+            use std::io::Write;
+            let file = std::fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file(
+                "mimetype",
+                opts.compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+            )
+            .unwrap();
+            let opf = format!(
+                r#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata><manifest><item id="ch" href="ch.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="ch"/></spine></package>"#
+            );
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.start_file("OEBPS/ch.xhtml", opts).unwrap();
+            zip.write_all(
+                format!(
+                    r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>{title}</p></body></html>"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path().join("lib")).unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let epub = srcdir.path().join("a.epub");
+        fixture_epub(&epub, "Delete Me", "Ann Author");
+        let epub2 = srcdir.path().join("b.epub");
+        fixture_epub(&epub2, "Delete Me Too", "Ann Author");
+        let id_of = |o: AddOutcome| match o {
+            AddOutcome::Added(b) => b.id,
+            AddOutcome::Duplicate(b) => b.id,
+        };
+        let a = id_of(lib.add_file(&epub).unwrap());
+        let b = id_of(lib.add_file(&epub2).unwrap());
+        assert_ne!(a, b);
+        let dir_a = lib.abs_path(&lib.get_by_id(a).unwrap().unwrap().file_path);
+        assert!(dir_a.exists());
+        lib.record_check(a, Some(7)).unwrap();
+        // Unknown ids are ignored.
+        assert_eq!(lib.delete_books(&[999_999]).unwrap(), 0);
+        // Delete one: row, dir, and check row go away.
+        assert_eq!(lib.delete_books(&[a]).unwrap(), 1);
+        assert!(lib.get_by_id(a).unwrap().is_none());
+        assert!(!dir_a.exists());
+        assert_eq!(lib.get_check(a).unwrap(), None);
+        // The other book is untouched.
+        assert!(lib.get_by_id(b).unwrap().is_some());
     }
 }
