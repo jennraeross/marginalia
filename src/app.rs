@@ -1152,7 +1152,39 @@ impl MarginaliaApp {
         }
         self.jobs.busy = true;
         self.jobs.push(format!("checking {} fics …", tracked.len()));
-        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), false);
+        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), false, None);
+    }
+
+    /// Check only the checked books (select mode): resolves checked ids to
+    /// tracked (id, title, url) items; anything else is reported, not run.
+    fn start_check_selected(&mut self) {
+        let items = self.checked_tracked_items();
+        if items.is_empty() {
+            self.error = Some("no tracked fics selected".into());
+            return;
+        }
+        self.jobs.busy = true;
+        self.jobs
+            .push(format!("checking {} selected fics …", items.len()));
+        Self::spawn_update_check(
+            self.tx.clone(),
+            self.lib.root.clone(),
+            false,
+            Some(items.iter().map(|(id, _, _)| *id).collect()),
+        );
+    }
+
+    /// Checked ids resolved to tracked check items (id, title, url).
+    fn checked_tracked_items(&self) -> Vec<(i64, String, String)> {
+        let mut items = Vec::new();
+        for id in &self.checked {
+            if let Some(b) = self.lib.get_by_id(*id).ok().flatten() {
+                if let Some(url) = b.fanfic_url.filter(|u| !u.trim().is_empty()) {
+                    items.push((b.id, b.title, url));
+                }
+            }
+        }
+        items
     }
 
     /// Quiet background pass at startup: hydrates markers from cache and
@@ -1162,7 +1194,7 @@ impl MarginaliaApp {
         if self.tracked_count == 0 {
             return;
         }
-        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), true);
+        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), true, None);
     }
 
     /// One attempted remote chapter count: `Some(r)` (cache it; `r` is `None`
@@ -1222,7 +1254,12 @@ impl MarginaliaApp {
         }
     }
 
-    fn spawn_update_check(tx: mpsc::Sender<JobEvent>, root: std::path::PathBuf, silent: bool) {
+    fn spawn_update_check(
+        tx: mpsc::Sender<JobEvent>,
+        root: std::path::PathBuf,
+        silent: bool,
+        only: Option<std::collections::HashSet<i64>>,
+    ) {
         std::thread::spawn(move || {
             let lib = match Library::open(root) {
                 Ok(l) => l,
@@ -1231,12 +1268,16 @@ impl MarginaliaApp {
                     return;
                 }
             };
-            let items: Vec<(i64, String, String)> = lib
+            let mut items: Vec<(i64, String, String)> = lib
                 .tracked()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|b| (b.id, b.title, b.fanfic_url.unwrap_or_default()))
                 .collect();
+            // Narrow to an explicit id set (select mode).
+            if let Some(only) = only {
+                items.retain(|(id, _, _)| only.contains(id));
+            }
             if items.is_empty() {
                 return;
             }
@@ -1664,7 +1705,20 @@ impl eframe::App for MarginaliaApp {
                                 self.start_update_all();
                             }
                         }
-                        if fff && self.tracked_count > 0 && ui.button("⇪ Check").clicked() {
+                        if self.select_mode {
+                            let n = self.checked.len();
+                            if ui
+                                .add_enabled(
+                                    n > 0,
+                                    egui::Button::new(format!("⇪ Check selected ({n})")),
+                                )
+                                .on_hover_text("check only the checked fics")
+                                .clicked()
+                            {
+                                self.start_check_selected();
+                            }
+                        } else if fff && self.tracked_count > 0 && ui.button("⇪ Check").clicked()
+                        {
                             self.start_check_updates();
                         }
                         if !fff {
@@ -1810,7 +1864,7 @@ impl eframe::App for MarginaliaApp {
                 ui.label("Download: fetch a fic URL via fanficfare.");
                 ui.label("Update: refresh selected tracked fic (keeps position).");
                 ui.label("Update all: refresh every tracked fic (skips books a Check found up to date).");
-                ui.label("Check: poll tracked fics' metadata for new chapters (session-only ⇪ markers).");
+                ui.label("Check: poll tracked fics' metadata for new chapters (session-only ⇪ markers; selected fics in select mode).");
                 ui.label("Select: checkbox mode for batch Update/Delete over checked fics (All selects the filtered view).");
                 ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev, TOC, and TTS on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
                 if ui.button("Close").clicked() {
@@ -3921,6 +3975,23 @@ mod tests {
         app.selected = Some(2);
         app.prune_deleted(&[9]);
         assert_eq!(app.selected, Some(2));
+    }
+
+    #[test]
+    fn check_selected_needs_tracked_selection() {
+        let mut app = fixture_app();
+        app.select_mode = true;
+        // Checked id resolves to nothing: no tracked fics selected.
+        app.checked = std::collections::HashSet::from([1]);
+        app.start_check_selected();
+        assert_eq!(app.error.as_deref(), Some("no tracked fics selected"));
+        assert!(!app.jobs.busy);
+        // Empty selection errors the same way, without touching the network.
+        app.error = None;
+        app.checked.clear();
+        app.start_check_selected();
+        assert_eq!(app.error.as_deref(), Some("no tracked fics selected"));
+        assert!(!app.jobs.busy);
     }
 
     #[test]
