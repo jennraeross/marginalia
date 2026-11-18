@@ -2,13 +2,15 @@
 name = "marginalia"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Cross-platform EPUB library + reader with FanFicFare support"
 
 [dependencies]
 eframe = "0.37"
 egui = "0.37"
 egui_extras = "0.37"
 rusqlite = { version = "0.42", features = ["bundled"] }
-epub = "2.1"
+roxmltree = "0.21"
 sha2 = "0.11"
 hex = "0.4"
 directories = "6.0"
@@ -23,3 +25,12 @@ chrono = "0.4"
 tempfile = "3"
 zip = "2"
 tts = "0.26.3"
+
+[package.metadata.packager]
+before-packaging-command = "cargo build --release"
+product-name = "Marginalia"
+identifier = "com.jennraeross.marginalia"
+description = "Cross-platform EPUB library + reader with FanFicFare support"
+license-file = "LICENSE"
+out-dir = "dist"
+icons = ["assets/icon-512.png"]

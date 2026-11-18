@@ -1,7 +1,7 @@
 use crate::epub_utils::{self, plain_spans, spans_plain, Block, Chapter, TocEntry};
 use crate::fanficfare;
 use crate::fonts;
-use crate::library::{AddOutcome, Book, Library, SortKey};
+use crate::library::{AddOutcome, Annotation, Book, Library, SortKey};
 use crate::speech::{blocks_to_speech, SpeechEngine};
 use crate::themes::ThemeId;
 use std::collections::{HashMap, VecDeque};
@@ -11,6 +11,12 @@ enum JobEvent {
     Message(String),
     Refresh,
     ReaderReload(i64),
+    ChapterReady {
+        book_id: i64,
+        gen: u64,
+        index: usize,
+        chapter: Chapter,
+    },
     CheckDone(Vec<(i64, fanficfare::CheckState)>),
     Done(String),
     Error(String),
@@ -89,6 +95,38 @@ fn is_updatable(b: &Book) -> bool {
     b.fanfic_url.as_ref().is_some_and(|u| !u.trim().is_empty())
 }
 
+/// Sort tier for the NeedsUpdate column: updates first, then tracked-but-
+/// unchecked books (they may be hiding updates), then up to date, then
+/// untracked books (which can never need an update).
+fn update_rank(book: &Book, state: Option<&fanficfare::CheckState>) -> u8 {
+    match state {
+        Some(fanficfare::CheckState::UpdateAvailable { .. }) => 0,
+        None if is_updatable(book) => 1,
+        Some(fanficfare::CheckState::UpToDate) => 2,
+        None => 3,
+    }
+}
+
+/// New chapters pending for a book (0 unless a check found some).
+fn pending_chapters(state: Option<&fanficfare::CheckState>) -> usize {
+    match state {
+        Some(fanficfare::CheckState::UpdateAvailable { new_chapters }) => *new_chapters,
+        _ => 0,
+    }
+}
+
+/// Order books for `SortKey::NeedsUpdate`: by tier, then most new chapters
+/// first. Stable, so the SQL fallback order survives within equal ranks.
+fn sort_by_update(books: &mut [Book], states: &HashMap<i64, fanficfare::CheckState>) {
+    books.sort_by(|a, b| {
+        update_rank(a, states.get(&a.id))
+            .cmp(&update_rank(b, states.get(&b.id)))
+            .then_with(|| {
+                pending_chapters(states.get(&b.id)).cmp(&pending_chapters(states.get(&a.id)))
+            })
+    });
+}
+
 /// Char-index slice of `s` (`start..end` in chars, clamped). Never panics on
 /// multi-byte boundaries.
 fn slice_chars(s: &str, start: usize, end: usize) -> String {
@@ -112,6 +150,48 @@ struct SelBlock {
     flow_idx: usize,
     rect: egui::Rect,
     col: u8,
+}
+
+/// Origin of one paginated flow block in the chapter's original blocks.
+/// `None` marks the synthetic chapter-title block that exists only in `flow`.
+#[derive(Debug, Clone)]
+struct FlowOrigin {
+    orig: Option<usize>,
+    /// Char offset in the original block's anchor text where this fragment
+    /// starts (0 for unsplit blocks; head keeps 0, tail skips the split gap).
+    base: usize,
+}
+
+/// One annotation resolved against the current chapter/flow for painting.
+/// `orphan` means the quote no longer resolves (edited away or unlocatable).
+#[derive(Debug, Clone)]
+struct ResolvedHighlight {
+    id: i64,
+    color: String,
+    note: String,
+    flow_start: usize,
+    flow_so: usize,
+    flow_end: usize,
+    flow_eo: usize,
+    orphan: bool,
+}
+
+/// Note editor state for an existing annotation.
+#[derive(Debug, Clone)]
+struct NoteEdit {
+    id: i64,
+    color: String,
+    text: String,
+}
+
+/// Fill for a highlight color id (translucent so glyphs stay legible).
+fn annotation_fill(color: &str) -> egui::Color32 {
+    match color {
+        "green" => egui::Color32::from_rgba_unmultiplied(165, 214, 167, 110),
+        "pink" => egui::Color32::from_rgba_unmultiplied(244, 143, 177, 110),
+        "blue" => egui::Color32::from_rgba_unmultiplied(144, 202, 249, 110),
+        _ => egui::Color32::from_rgba_unmultiplied(255, 235, 59, 110),
+    }
 }
 
 /// An enlarged inline image shown in a modal overlay.
@@ -166,24 +246,43 @@ pub struct MarginaliaApp {
     sort: SortKey,
     sort_reverse: bool,
     selected: Option<i64>,
-    /// Select mode for batch operations: checked book ids (stable across
-    /// sort/search/refresh). Cleared when leaving select mode.
-    select_mode: bool,
+    /// Checked book ids for batch operations (stable across
+    /// sort/search/refresh).
     checked: std::collections::HashSet<i64>,
     /// Pending delete confirmation: (id, title) pairs awaiting Confirm.
     delete_confirm: Option<Vec<(i64, String)>>,
     view: View,
     reader_book: Option<Book>,
     toc: Vec<TocEntry>,
-    chapters: Vec<Chapter>,
+    /// Positional spine chapters: `len` is the spine count from open, `None`
+    /// while that chapter hasn't been parsed yet (background fill or failed).
+    chapters: Vec<Option<Chapter>>,
+    /// Positional spine hrefs from `book_skeleton` (stable before chapters
+    /// parse, so annotation href matching works while filling).
+    chapter_hrefs: Vec<String>,
+    /// Generation of the current open: background fills tag their chapters so
+    /// a fast close/reopen can't mix chapters across opens.
+    reader_gen: u64,
     current: usize,
     page: usize,
     pages: Vec<PageDef>,
     flow: Vec<Block>,
+    flow_origins: Vec<FlowOrigin>,
     pages_key: Option<PagesKey>,
     last_content_w: f32,
     last_page_h: f32,
     toc_open: bool,
+    show_notes: bool,
+    annotations: Vec<Annotation>,
+    resolved: Vec<ResolvedHighlight>,
+    note_edit: Option<NoteEdit>,
+    /// Deferred jump to an annotation id (from the Notes panel): applied
+    /// after pages rebuild for the target chapter.
+    pending_ann_jump: Option<i64>,
+    /// A reader context menu was open at the end of the previous frame.
+    /// While set, primary presses belong to the menu: starting a drag here
+    /// would wipe the selection the menu acts on before the menu item runs.
+    menu_open: bool,
     font_size: f32,
     font_weight: f32,
     reader_font: String,
@@ -264,21 +363,29 @@ impl MarginaliaApp {
             sort: SortKey::Recent,
             sort_reverse: false,
             selected: None,
-            select_mode: false,
             checked: std::collections::HashSet::new(),
             delete_confirm: None,
             view: View::Library,
             reader_book: None,
             toc: vec![],
             chapters: vec![],
+            chapter_hrefs: vec![],
+            reader_gen: 0,
             current: 0,
             page: 0,
             pages: vec![],
             flow: vec![],
+            flow_origins: vec![],
             pages_key: None,
             last_content_w: 0.0,
             last_page_h: 0.0,
             toc_open: false,
+            show_notes: false,
+            annotations: vec![],
+            resolved: vec![],
+            note_edit: None,
+            pending_ann_jump: None,
+            menu_open: false,
             font_size: saved_display.font_size,
             font_weight: saved_display.font_weight,
             reader_font: saved_display.font_family.clone(),
@@ -383,6 +490,9 @@ impl MarginaliaApp {
     fn refresh(&mut self) {
         match self.lib.list(&self.query, self.sort) {
             Ok(mut books) => {
+                if self.sort == SortKey::NeedsUpdate {
+                    sort_by_update(&mut books, &self.check_state);
+                }
                 if self.sort_reverse {
                     books.reverse();
                 }
@@ -429,6 +539,26 @@ impl MarginaliaApp {
                 JobEvent::CheckDone(results) => {
                     for (id, state) in results {
                         self.check_state.insert(id, state);
+                    }
+                    // Fresh check results can reorder the NeedsUpdate sort.
+                    dirty = true;
+                }
+                JobEvent::ChapterReady {
+                    book_id,
+                    gen,
+                    index,
+                    chapter,
+                } => {
+                    if self.reader_book.as_ref().is_some_and(|b| b.id == book_id)
+                        && self.reader_gen == gen
+                        && index < self.chapters.len()
+                    {
+                        self.chapters[index] = Some(chapter);
+                        self.maybe_build_fallback_toc();
+                        if index == self.current {
+                            self.pages_key = None;
+                            self.refresh_resolved();
+                        }
                     }
                 }
                 JobEvent::Done(m) => {
@@ -496,12 +626,32 @@ impl MarginaliaApp {
             return;
         };
         let path = self.lib.abs_path(&book.file_path);
-        match epub_utils::load_book(&path) {
-            Ok((toc, chapters)) => {
-                let start = (book.progress_chapter as usize).min(chapters.len().saturating_sub(1));
-                let page = book.progress_page.max(0) as usize;
+        // Lazy open: skeleton (hrefs + TOC, no chapter bodies) then only the
+        // target chapter sync. The rest fills in nearest-first off-thread, so
+        // a large book costs ~one chapter parse on the UI thread.
+        let (toc, hrefs) = match epub_utils::book_skeleton(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                self.error = Some(format!("cannot read epub: {e}"));
+                return;
+            }
+        };
+        if hrefs.is_empty() {
+            self.error = Some("cannot read epub: no chapters".into());
+            return;
+        };
+        let start = (book.progress_chapter as usize).min(hrefs.len().saturating_sub(1));
+        let page = book.progress_page.max(0) as usize;
+        match epub_utils::load_chapter(&path, start, &toc) {
+            Ok(first) => {
+                self.reader_gen = self.reader_gen.wrapping_add(1);
+                let gen = self.reader_gen;
                 self.reader_book = Some(book);
                 self.toc = toc;
+                self.chapter_hrefs = hrefs;
+                let mut chapters: Vec<Option<Chapter>> =
+                    (0..self.chapter_hrefs.len()).map(|_| None).collect();
+                chapters[start] = Some(first);
                 self.chapters = chapters;
                 self.current = start;
                 // Pages are rebuilt on the next frame once geometry is known;
@@ -509,9 +659,113 @@ impl MarginaliaApp {
                 self.page = page;
                 self.pages_key = None;
                 self.clear_selection();
+                self.show_notes = false;
+                self.note_edit = None;
+                self.pending_ann_jump = None;
+                self.menu_open = false;
+                self.load_annotations();
+                self.maybe_build_fallback_toc();
+                let total = self.chapters.len();
+                if total > 1 {
+                    self.spawn_chapter_fill(id, gen, path, start, total, self.toc.clone());
+                }
             }
             Err(e) => self.error = Some(format!("cannot read epub: {e}")),
         }
+    }
+
+    /// No-nav-TOC fallback once every chapter is in: one entry per chapter
+    /// from its label. Mirrors `load_book`'s heading fallback (labels of
+    /// heading-led chapters are those headings); heading-less chapters gain a
+    /// `Chapter N` entry so every chapter stays reachable.
+    fn maybe_build_fallback_toc(&mut self) {
+        if !self.toc.is_empty() || self.chapters.is_empty() {
+            return;
+        }
+        if self.chapters.iter().any(|c| c.is_none()) {
+            return;
+        }
+        self.toc = self
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| TocEntry {
+                depth: 0,
+                label: ch
+                    .as_ref()
+                    .map(|c| c.label.clone())
+                    .unwrap_or_else(|| format!("Chapter {}", i + 1)),
+                chapter: Some(i),
+            })
+            .collect();
+    }
+
+    /// Parse one spine chapter sync (single-chapter cost) when navigation
+    /// lands on a chapter the background fill hasn't reached yet.
+    fn ensure_chapter(&mut self, idx: usize) -> bool {
+        if self.chapters.get(idx).and_then(|o| o.as_ref()).is_some() {
+            return true;
+        }
+        if idx >= self.chapters.len() {
+            return false;
+        }
+        let path = match &self.reader_book {
+            Some(b) => self.lib.abs_path(&b.file_path),
+            None => return false,
+        };
+        match epub_utils::load_chapter(&path, idx, &self.toc) {
+            Ok(ch) => {
+                if idx < self.chapters.len() {
+                    self.chapters[idx] = Some(ch);
+                    self.maybe_build_fallback_toc();
+                    self.refresh_resolved();
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Fill unparsed spine chapters nearest-first off the UI thread. Each
+    /// chapter re-opens the EPUB (cheap zip walk vs. full-book HTML parse on
+    /// the frame); `gen` drops stale fills after a fast close/reopen.
+    fn spawn_chapter_fill(
+        &self,
+        book_id: i64,
+        gen: u64,
+        path: std::path::PathBuf,
+        start: usize,
+        total: usize,
+        toc: Vec<TocEntry>,
+    ) {
+        let mut order = Vec::new();
+        for dist in 1..total {
+            if start + dist < total {
+                order.push(start + dist);
+            }
+            if dist <= start {
+                order.push(start - dist);
+            }
+        }
+        if order.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            for idx in order {
+                match epub_utils::load_chapter(&path, idx, &toc) {
+                    Ok(ch) => {
+                        let _ = tx.send(JobEvent::ChapterReady {
+                            book_id,
+                            gen,
+                            index: idx,
+                            chapter: ch,
+                        });
+                    }
+                    Err(_) => continue,
+                }
+            }
+        });
     }
 
     /// Show or hide the OS cursor, sending a viewport command only on
@@ -534,11 +788,21 @@ impl MarginaliaApp {
         }
         self.reader_book = None;
         self.chapters.clear();
+        self.chapter_hrefs.clear();
+        // Invalidate any in-flight background fill for this open.
+        self.reader_gen = self.reader_gen.wrapping_add(1);
         self.toc.clear();
         self.pages.clear();
         self.flow.clear();
+        self.flow_origins.clear();
         self.pages_key = None;
         self.clear_selection();
+        self.annotations.clear();
+        self.resolved.clear();
+        self.note_edit = None;
+        self.show_notes = false;
+        self.pending_ann_jump = None;
+        self.menu_open = false;
         self.view = View::Library;
         self.refresh();
     }
@@ -552,6 +816,9 @@ impl MarginaliaApp {
         self.page = 0;
         self.pages_key = None;
         self.clear_selection();
+        // Navigation ahead of the background fill parses just this chapter.
+        self.ensure_chapter(idx);
+        self.refresh_resolved();
         if let Some(b) = &self.reader_book {
             let _ = self.lib.save_progress(b.id, idx as i64, 0);
         }
@@ -572,6 +839,286 @@ impl MarginaliaApp {
         self.sel_dragging = false;
     }
 
+    /// Load all annotations for the open book (chapter turns filter locally).
+    fn load_annotations(&mut self) {
+        if let Some(b) = &self.reader_book {
+            self.annotations = self.lib.list_annotations(b.id).unwrap_or_default();
+        } else {
+            self.annotations.clear();
+        }
+        self.refresh_resolved();
+    }
+
+    /// Anchor texts of one original chapter (stable across pagination).
+    /// Empty while that chapter hasn't been parsed yet.
+    fn orig_texts(&self, chapter_idx: usize) -> Vec<String> {
+        self.chapters
+            .get(chapter_idx)
+            .and_then(|o| o.as_ref())
+            .map(|ch| ch.blocks.iter().map(epub_utils::anchor_text).collect())
+            .unwrap_or_default()
+    }
+
+    /// Which chapter an annotation belongs to now: href match first (stable
+    /// across fic updates that append chapters, and available before the
+    /// chapter parses via the skeleton hrefs), then the stored index when
+    /// the quote still resolves there, then a book-wide quote search over
+    /// parsed chapters. An unparsed stored-index target is returned
+    /// optimistically so navigation can load it and resolve after.
+    fn annotation_chapter(&self, ann: &Annotation) -> Option<usize> {
+        if let Some(pos) = self
+            .chapter_hrefs
+            .iter()
+            .position(|h| *h == ann.chapter_href)
+        {
+            return Some(pos);
+        }
+        let len = self.chapters.len();
+        if len == 0 {
+            return None;
+        }
+        let idx = (ann.chapter_index.max(0) as usize).min(len.saturating_sub(1));
+        if self.chapters.get(idx).and_then(|o| o.as_ref()).is_none() {
+            return Some(idx);
+        }
+        let texts = self.orig_texts(idx);
+        if epub_utils::find_anchor(
+            &texts,
+            ann.start_block.max(0) as usize,
+            ann.start_offset.max(0) as usize,
+            ann.end_block.max(0) as usize,
+            ann.end_offset.max(0) as usize,
+            &ann.quote,
+            &ann.prefix,
+            &ann.suffix,
+        )
+        .is_some()
+        {
+            return Some(idx);
+        }
+        // Book-wide fuzzy fallback for moved/renamed chapters, over parsed
+        // chapters only.
+        for (ci, ch) in self.chapters.iter().enumerate() {
+            let Some(ch) = ch else { continue };
+            let texts: Vec<String> = ch.blocks.iter().map(epub_utils::anchor_text).collect();
+            if epub_utils::find_anchor(
+                &texts,
+                ann.start_block.max(0) as usize,
+                ann.start_offset.max(0) as usize,
+                ann.end_block.max(0) as usize,
+                ann.end_offset.max(0) as usize,
+                &ann.quote,
+                &ann.prefix,
+                &ann.suffix,
+            )
+            .is_some()
+            {
+                return Some(ci);
+            }
+        }
+        None
+    }
+
+    /// Map an original-block range to flow coordinates via `flow_origins`.
+    fn map_orig_to_flow(
+        &self,
+        sb: usize,
+        so: usize,
+        eb: usize,
+        eo: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let frag_len =
+            |fi: usize| -> usize { Self::layout_text_of(&self.flow[fi]).chars().count() };
+        // Fragments of each endpoint block, in flow order.
+        let mut start_frags = Vec::new();
+        let mut end_frags = Vec::new();
+        for (fi, o) in self.flow_origins.iter().enumerate() {
+            if o.orig == Some(sb) {
+                start_frags.push((fi, o.base, frag_len(fi)));
+            }
+            if o.orig == Some(eb) {
+                end_frags.push((fi, o.base, frag_len(fi)));
+            }
+        }
+        if start_frags.is_empty() || end_frags.is_empty() {
+            return None;
+        }
+        // Start: fragment containing `so` (or the last fragment's end when
+        // the offset is at the very end of the block).
+        let mut start = None;
+        for (fi, base, len) in &start_frags {
+            if *base <= so && so <= base + len {
+                start = Some((*fi, (so - base).min(*len)));
+                break;
+            }
+        }
+        if start.is_none() {
+            let (fi, _, len) = *start_frags.last().unwrap();
+            start = Some((fi, len));
+        }
+        // End: fragment containing `eo`; ordering against the start is
+        // validated below.
+        let mut end = None;
+        for (fi, base, len) in &end_frags {
+            if *base <= eo && eo <= base + len {
+                end = Some((*fi, (eo - base).min(*len)));
+                break;
+            }
+        }
+        if end.is_none() {
+            let (fi, _, len) = *end_frags.last().unwrap();
+            end = Some((fi, len));
+        }
+        let (sfi, sso) = start.unwrap();
+        let (efi, eeo) = end.unwrap();
+        if sb == eb && (efi < sfi || (efi == sfi && eeo < sso)) {
+            return None;
+        }
+        if efi < sfi {
+            return None;
+        }
+        Some((sfi, sso, efi, eeo))
+    }
+
+    /// Map a flow position to its original block + offset (for storing new
+    /// annotations in stable coordinates). Synthetic title blocks (`None`)
+    /// can't be annotated.
+    fn flow_to_orig(&self, flow_idx: usize, flow_off: usize) -> Option<(usize, usize)> {
+        let o = self.flow_origins.get(flow_idx)?;
+        let orig = o.orig?;
+        let orig_len = self
+            .chapters
+            .get(self.current)?
+            .as_ref()?
+            .blocks
+            .get(orig)
+            .map(epub_utils::anchor_text)
+            .map(|t| t.chars().count())
+            .unwrap_or(usize::MAX);
+        Some((orig, (o.base + flow_off).min(orig_len)))
+    }
+
+    /// Rebuild `resolved` for the current chapter/flow. Called after paginate,
+    /// chapter turns, and annotation CRUD.
+    fn refresh_resolved(&mut self) {
+        self.resolved.clear();
+        if self.chapters.is_empty() {
+            return;
+        }
+        for ann in self.annotations.clone() {
+            let Some(ch_idx) = self.annotation_chapter(&ann) else {
+                continue;
+            };
+            if ch_idx != self.current {
+                continue;
+            }
+            let texts = self.orig_texts(ch_idx);
+            let found = epub_utils::find_anchor(
+                &texts,
+                ann.start_block.max(0) as usize,
+                ann.start_offset.max(0) as usize,
+                ann.end_block.max(0) as usize,
+                ann.end_offset.max(0) as usize,
+                &ann.quote,
+                &ann.prefix,
+                &ann.suffix,
+            );
+            if let Some((sb, so, eb, eo)) = found {
+                if let Some((fs, fso, fe, feo)) = self.map_orig_to_flow(sb, so, eb, eo) {
+                    self.resolved.push(ResolvedHighlight {
+                        id: ann.id,
+                        color: ann.color.clone(),
+                        note: ann.note.clone(),
+                        flow_start: fs,
+                        flow_so: fso,
+                        flow_end: fe,
+                        flow_eo: feo,
+                        orphan: false,
+                    });
+                    continue;
+                }
+            }
+            // Unresolvable in this chapter right now (edited away or mapped
+            // title-only): keep for the Notes panel as orphaned.
+            self.resolved.push(ResolvedHighlight {
+                id: ann.id,
+                color: ann.color.clone(),
+                note: ann.note.clone(),
+                flow_start: 0,
+                flow_so: 0,
+                flow_end: 0,
+                flow_eo: 0,
+                orphan: true,
+            });
+        }
+    }
+
+    /// Create a highlight from the current selection in `color`, opening the
+    /// note editor when `with_note` is set. Title-block selections are
+    /// rejected (synthetic, unanchorable).
+    fn highlight_selection(&mut self, color: &str, with_note: bool) {
+        let Some(((sb, sc), (eb, ec))) = self.ordered_selection() else {
+            return;
+        };
+        let color = if crate::library::is_annotation_color(color) {
+            color.to_string()
+        } else {
+            "yellow".to_string()
+        };
+        for fi in sb..=eb {
+            if self.flow_origins.get(fi).and_then(|o| o.orig).is_none() {
+                self.error = Some("chapter titles can't be highlighted".into());
+                return;
+            }
+        }
+        let (Some((mut osb, mut oso)), Some((mut oeb, mut oeo))) =
+            (self.flow_to_orig(sb, sc), self.flow_to_orig(eb, ec))
+        else {
+            self.error = Some("couldn't anchor that highlight".into());
+            return;
+        };
+        if (oeb, oeo) < (osb, oso) {
+            std::mem::swap(&mut osb, &mut oeb);
+            std::mem::swap(&mut oso, &mut oeo);
+        }
+        if osb == oeb && oso == oeo {
+            return;
+        }
+        let quote = self.selection_text();
+        if quote.trim().is_empty() {
+            return;
+        }
+        let start_text = Self::layout_text_of(&self.flow[sb]);
+        let end_text = Self::layout_text_of(&self.flow[eb]);
+        let prefix = epub_utils::slice_chars(&start_text, sc.saturating_sub(32), sc);
+        let suffix = epub_utils::slice_chars(&end_text, ec, ec + 32);
+        let (href, ch_idx, book_id) = match (
+            self.chapters.get(self.current).and_then(|o| o.as_ref()),
+            &self.reader_book,
+        ) {
+            (Some(ch), Some(b)) => (ch.href.clone(), self.current as i64, b.id),
+            _ => return,
+        };
+        match self.lib.add_annotation(
+            book_id, &href, ch_idx, osb as i64, oso as i64, oeb as i64, oeo as i64, &color, "",
+            &quote, &prefix, &suffix,
+        ) {
+            Ok(ann) => {
+                self.annotations = self.lib.list_annotations(book_id).unwrap_or_default();
+                self.refresh_resolved();
+                self.clear_selection();
+                if with_note {
+                    self.note_edit = Some(NoteEdit {
+                        id: ann.id,
+                        color: ann.color,
+                        text: String::new(),
+                    });
+                }
+            }
+            Err(e) => self.error = Some(format!("highlight failed: {e}")),
+        }
+    }
+
     /// Ordered selection endpoints, if a non-empty range is selected.
     fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
         let (a, b) = (self.sel_anchor?, self.sel_active?);
@@ -581,15 +1128,25 @@ impl MarginaliaApp {
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
+    /// Annotation id whose resolved highlight range contains
+    /// `(flow_idx, off)`, if any. Later highlights paint on top, so the last
+    /// match wins.
+    fn highlight_at(&self, flow_idx: usize, off: usize) -> Option<i64> {
+        self.resolved
+            .iter()
+            .rev()
+            .find(|h| {
+                !h.orphan
+                    && (h.flow_start, h.flow_so) <= (flow_idx, off)
+                    && (flow_idx, off) <= (h.flow_end, h.flow_eo)
+            })
+            .map(|h| h.id)
+    }
+
     /// Layout text of a block (what hit-testing and painting measure).
     /// List items include the rendered bullet prefix.
     fn layout_text_of(b: &Block) -> String {
-        match b {
-            Block::Heading(_, s) | Block::Paragraph(s) | Block::Quote(s) => spans_plain(s),
-            Block::ListItem(s) => format!("• {}", spans_plain(s)),
-            Block::Pre(t) => t.clone(),
-            Block::Image { .. } => String::new(),
-        }
+        epub_utils::anchor_text(b)
     }
 
     /// Plain copy text of a block slice in layout-text coordinates.
@@ -860,15 +1417,21 @@ impl MarginaliaApp {
             .any(|r| r.rect.expand(4.0).contains(pos))
     }
 
-    /// Paint the current selection as translucent row ranges over the text.
-    /// Must run after the page rendered (uses fresh rects + rebuilt galleys).
-    fn paint_selection(&self, ui: &mut egui::Ui, rects: &[SelBlock], col_w: f32) {
+    /// Paint one flow range as translucent row ranges over the text.
+    /// Shared by selection and highlight painting.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_range(
+        &self,
+        ui: &mut egui::Ui,
+        rects: &[SelBlock],
+        col_w: f32,
+        sb: usize,
+        sc: usize,
+        eb: usize,
+        ec: usize,
+        fill: egui::Color32,
+    ) {
         use egui::text::CCursor;
-        let Some(((sb, sc), (eb, ec))) = self.ordered_selection() else {
-            return;
-        };
-        let mut fill = ui.visuals().selection.bg_fill;
-        fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 110);
         for r in rects {
             if r.flow_idx < sb || r.flow_idx > eb {
                 continue;
@@ -924,6 +1487,59 @@ impl MarginaliaApp {
                     r.rect.left_top() + placed.pos.to_vec2() + egui::vec2(right, placed.row.size.y);
                 ui.painter()
                     .rect_filled(egui::Rect::from_min_max(min, max), 0.0, fill);
+            }
+        }
+    }
+
+    /// Paint the current selection as translucent row ranges over the text.
+    /// Must run after the page rendered (uses fresh rects + rebuilt galleys).
+    fn paint_selection(&self, ui: &mut egui::Ui, rects: &[SelBlock], col_w: f32) {
+        let Some(((sb, sc), (eb, ec))) = self.ordered_selection() else {
+            return;
+        };
+        let mut fill = ui.visuals().selection.bg_fill;
+        fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 110);
+        self.paint_range(ui, rects, col_w, sb, sc, eb, ec, fill);
+    }
+
+    /// Paint saved highlights for the current page underneath the selection.
+    /// A small dot marks highlights carrying a note.
+    fn paint_highlights(&self, ui: &mut egui::Ui, rects: &[SelBlock], col_w: f32) {
+        let Some(pg) = self.pages.get(self.page).cloned() else {
+            return;
+        };
+        for h in &self.resolved {
+            if h.orphan {
+                continue;
+            }
+            if h.flow_end < pg.start || h.flow_start >= pg.end {
+                continue;
+            }
+            self.paint_range(
+                ui,
+                rects,
+                col_w,
+                h.flow_start,
+                h.flow_so,
+                h.flow_end,
+                h.flow_eo,
+                annotation_fill(&h.color),
+            );
+        }
+        // Note dots: one per highlight with a note, at its start block.
+        for r in rects {
+            for h in &self.resolved {
+                if h.orphan || h.note.trim().is_empty() {
+                    continue;
+                }
+                if r.flow_idx == h.flow_start {
+                    let dot = egui::Rect::from_min_size(
+                        egui::pos2(r.rect.max.x - 8.0, r.rect.min.y + 2.0),
+                        egui::vec2(6.0, 6.0),
+                    );
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.0, egui::Color32::BLACK);
+                }
             }
         }
     }
@@ -1139,23 +1755,7 @@ impl MarginaliaApp {
     /// window reuse the cached remote count without network traffic.
     const CHECK_TTL_SECS: i64 = 12 * 3600;
 
-    /// Metadata-only update check over tracked books (session-only results,
-    /// backed by a persistent check cache).
-    /// AO3 books use a fast native work-page fetch; everything else (and AO3
-    /// fallbacks) use FanFicFare. Books with a fresh cached check skip the
-    /// network; every attempted fetch is cached for next time.
-    fn start_check_updates(&mut self) {
-        let tracked = self.lib.tracked().unwrap_or_default();
-        if tracked.is_empty() {
-            self.error = Some("no tracked fics.".into());
-            return;
-        }
-        self.jobs.busy = true;
-        self.jobs.push(format!("checking {} fics …", tracked.len()));
-        Self::spawn_update_check(self.tx.clone(), self.lib.root.clone(), false, None);
-    }
-
-    /// Check only the checked books (select mode): resolves checked ids to
+    /// Check only the checked books: resolves checked ids to
     /// tracked (id, title, url) items; anything else is reported, not run.
     fn start_check_selected(&mut self) {
         let items = self.checked_tracked_items();
@@ -1359,20 +1959,6 @@ impl MarginaliaApp {
         });
     }
 
-    fn start_update_all(&mut self) {
-        if !fanficfare::is_available() {
-            self.error = Some("fanficfare not found on PATH.".into());
-            return;
-        }
-        let tracked = self.lib.tracked().unwrap_or_default();
-        if tracked.is_empty() {
-            self.error = Some("no FanFicFare-tracked books.".into());
-            return;
-        }
-        let ids: Vec<(i64, String)> = tracked.into_iter().map(|b| (b.id, b.title)).collect();
-        self.start_update_ids(ids, "tracked fics");
-    }
-
     /// Whether every book in the current (possibly filtered) view is checked.
     fn visible_all_checked(&self) -> bool {
         !self.books.is_empty() && self.books.iter().all(|b| self.checked.contains(&b.id))
@@ -1417,7 +2003,7 @@ impl MarginaliaApp {
         }
     }
 
-    /// Update the checked books (select mode). Only FanFicFare-tracked
+    /// Update the checked books. Only FanFicFare-tracked
     /// checked books are eligible; anything else is reported, not run.
     fn start_update_selected(&mut self) {
         if !fanficfare::is_available() {
@@ -1437,7 +2023,7 @@ impl MarginaliaApp {
         self.start_update_ids(ids, &note);
     }
 
-    /// Stage a delete confirmation for the checked books (select mode).
+    /// Stage a delete confirmation for the checked books.
     fn ask_delete_checked(&mut self) {
         let mut ids: Vec<(i64, String)> = self
             .books
@@ -1638,6 +2224,23 @@ impl eframe::App for MarginaliaApp {
                             self.close_reader();
                             self.sync_cursor(ui.ctx(), false);
                         }
+                        if ui.button("TOC").clicked() {
+                            self.toc_open = !self.toc_open;
+                        }
+                        if ui
+                            .button("Notes")
+                            .on_hover_text("highlights & notes")
+                            .clicked()
+                        {
+                            self.show_notes = !self.show_notes;
+                        }
+                        if ui.button("TTS").on_hover_text("read aloud (R)").clicked() {
+                            if self.reading_aloud {
+                                self.stop_reading();
+                            } else {
+                                self.start_reading();
+                            }
+                        }
                     } else {
                         if ui.button("+ Add").clicked() {
                             self.do_add_files();
@@ -1645,81 +2248,39 @@ impl eframe::App for MarginaliaApp {
                         if ui.button("⤓ Download").clicked() {
                             self.show_download = true;
                         }
-                        if ui
-                            .selectable_label(self.select_mode, "☑ Select")
-                            .on_hover_text("select mode: check fics for batch update/delete")
-                            .clicked()
-                        {
-                            self.select_mode = !self.select_mode;
-                            if !self.select_mode {
-                                self.checked.clear();
-                                self.delete_confirm = None;
-                            }
-                        }
                         // Update buttons hide (rather than disable) when the
                         // book can't be update-checked.
                         let fff = fanficfare::is_available();
-                        if self.select_mode {
-                            let n = self.checked.len();
-                            if fff
-                                && self.tracked_count > 0
-                                && ui
-                                    .add_enabled(
-                                        n > 0,
-                                        egui::Button::new(format!("↻ Update selected ({n})")),
-                                    )
-                                    .clicked()
-                            {
-                                self.start_update_selected();
-                            }
-                            if ui
+                        let n = self.checked.len();
+                        if fff
+                            && self.tracked_count > 0
+                            && ui
                                 .add_enabled(
                                     n > 0,
-                                    egui::Button::new(format!("🗑 Delete selected ({n})")),
+                                    egui::Button::new(format!("↻ Update selected ({n})")),
                                 )
                                 .clicked()
-                            {
-                                self.ask_delete_checked();
-                            }
-                        } else {
-                            if fff
-                                && self.selected_book().is_some_and(is_updatable)
-                                && ui.button("↻ Update").clicked()
-                            {
-                                if let Some(b) = self.selected_book() {
-                                    let id = b.id;
-                                    self.start_update_one(id);
-                                } else {
-                                    self.error = Some("no book selected".into());
-                                }
-                            }
-                            if fff
-                                && self.tracked_count > 0
-                                && ui
-                                    .button(format!(
-                                        "↻ Update all ({} of {})",
-                                        self.tracked_count, self.library_total
-                                    ))
-                                    .clicked()
-                            {
-                                self.start_update_all();
-                            }
-                        }
-                        if self.select_mode {
-                            let n = self.checked.len();
-                            if ui
-                                .add_enabled(
-                                    n > 0,
-                                    egui::Button::new(format!("⇪ Check selected ({n})")),
-                                )
-                                .on_hover_text("check only the checked fics")
-                                .clicked()
-                            {
-                                self.start_check_selected();
-                            }
-                        } else if fff && self.tracked_count > 0 && ui.button("⇪ Check").clicked()
                         {
-                            self.start_check_updates();
+                            self.start_update_selected();
+                        }
+                        if ui
+                            .add_enabled(
+                                n > 0,
+                                egui::Button::new(format!("🗑 Delete selected ({n})")),
+                            )
+                            .clicked()
+                        {
+                            self.ask_delete_checked();
+                        }
+                        if ui
+                            .add_enabled(
+                                n > 0,
+                                egui::Button::new(format!("⇪ Check selected ({n})")),
+                            )
+                            .on_hover_text("check only the checked fics")
+                            .clicked()
+                        {
+                            self.start_check_selected();
                         }
                         if !fff {
                             ui.weak("fanficfare missing").on_hover_text(
@@ -1862,11 +2423,10 @@ impl eframe::App for MarginaliaApp {
                 ui.label("Library: search/sort at the top with the sortable-columns library below, details on the right in wide windows and below in narrow ones. Click a row to select, double-click or Enter to read; Up/Down moves the selection.");
                 ui.label("Add: import .epub files into the library.");
                 ui.label("Download: fetch a fic URL via fanficfare.");
-                ui.label("Update: refresh selected tracked fic (keeps position).");
-                ui.label("Update all: refresh every tracked fic (skips books a Check found up to date).");
-                ui.label("Check: poll tracked fics' metadata for new chapters (session-only ⇪ markers; selected fics in select mode).");
-                ui.label("Select: checkbox mode for batch Update/Delete over checked fics (All selects the filtered view).");
-                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the bottom bar keeps Prev, TOC, and TTS on the left, Next on the right, and the page status centered between them. The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
+                ui.label("Update: refresh checked tracked fics (keeps position).");
+                ui.label("Check: poll checked fics' metadata for new chapters (session-only ⇪ markers).");
+                ui.label("Library: check fics for batch Update/Delete/Check (All selects the filtered view).");
+                ui.label("Reader: page turns with Space / ‹ Prev / Next › (or ←/→, PgUp/PgDn), spilling across chapters; Tab toggles the table of contents, R toggles read-aloud; the top bar holds Library, TOC, Notes, and TTS while the bottom bar keeps Prev on the left, Next on the right, and the page status centered between them. Select text and right-click for Copy / highlight colors / note; highlights persist per book with fuzzy matching across updates, listed under Notes (Jump/Edit/Delete, orphaned when unlocatable); click a highlight to open its note (edit it or delete the highlight). The top bar and buttons fade out after a few idle seconds, leaving only the status line and bar edges fading with them — move the mouse, scroll, or press a non-page key to bring them back (page turns don't reset the timer). Display settings (18 themes across light/dark sections, font, Auto/One/Two columns — Auto shows two unless too narrow) live in the Display window; click an image for a larger view (click outside, press Esc, or Close to dismiss). Position and display settings auto-save.");
                 if ui.button("Close").clicked() {
                     self.show_help = false;
                 }
@@ -1910,6 +2470,11 @@ impl eframe::App for MarginaliaApp {
         self.flush_display_settings();
         if self.jobs.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+        // Background chapter fill delivers through the job channel, which egui
+        // only polls on repaint: keep frames coming until every chapter is in.
+        if self.view == View::Reader && self.chapters.iter().any(|c| c.is_none()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
 }
@@ -1969,23 +2534,21 @@ impl MarginaliaApp {
                     self.refresh();
                 }
                 ui.weak(format!("{} books", self.books.len()));
-                if self.select_mode {
-                    if ui.small_button("All").clicked() {
-                        self.set_visible_checked(true);
-                    }
-                    if ui.small_button("None").clicked() {
-                        self.set_visible_checked(false);
-                    }
-                    ui.weak(format!(
-                        "{} selected{}",
-                        self.checked.len(),
-                        if self.visible_all_checked() {
-                            " (all)"
-                        } else {
-                            ""
-                        }
-                    ));
+                if ui.small_button("All").clicked() {
+                    self.set_visible_checked(true);
                 }
+                if ui.small_button("None").clicked() {
+                    self.set_visible_checked(false);
+                }
+                ui.weak(format!(
+                    "{} selected{}",
+                    self.checked.len(),
+                    if self.visible_all_checked() {
+                        " (all)"
+                    } else {
+                        ""
+                    }
+                ));
                 ui.label("Double-click a row to read.");
             });
             ui.separator();
@@ -2035,7 +2598,7 @@ impl MarginaliaApp {
     }
 
     /// Sortable details table: Title | Author | Series | Size | Added |
-    /// Progress | Fic. Click a row to select, double-click to read.
+    /// Progress | Update | Fic. Click a row to select, double-click to read.
     fn book_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
@@ -2058,9 +2621,7 @@ impl MarginaliaApp {
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-        if self.select_mode {
-            builder = builder.column(Column::auto().at_least(28.0));
-        }
+        builder = builder.column(Column::auto().at_least(28.0));
         builder
             .column(Column::remainder().at_least(140.0))
             .column(Column::auto().at_least(90.0).resizable(true))
@@ -2068,20 +2629,19 @@ impl MarginaliaApp {
             .column(Column::auto().at_least(64.0))
             .column(Column::auto().at_least(76.0))
             .column(Column::auto().at_least(56.0))
+            .column(Column::auto().at_least(56.0))
             .column(Column::auto().at_least(32.0))
             .header(26.0, |mut header| {
-                if self.select_mode {
-                    header.col(|ui| {
-                        let all = self.visible_all_checked();
-                        if ui
-                            .small_button(if all { "☑" } else { "☐" })
-                            .on_hover_text("select all / none (filtered view)")
-                            .clicked()
-                        {
-                            self.set_visible_checked(!all);
-                        }
-                    });
-                }
+                header.col(|ui| {
+                    let all = self.visible_all_checked();
+                    if ui
+                        .small_button(if all { "☑" } else { "☐" })
+                        .on_hover_text("select all / none (filtered view)")
+                        .clicked()
+                    {
+                        self.set_visible_checked(!all);
+                    }
+                });
                 for (key, name) in [
                     (SortKey::Title, "Title"),
                     (SortKey::Author, "Author"),
@@ -2089,6 +2649,7 @@ impl MarginaliaApp {
                     (SortKey::Size, "Size"),
                     (SortKey::Added, "Added"),
                     (SortKey::Progress, "Ch"),
+                    (SortKey::NeedsUpdate, "Update"),
                 ] {
                     header.col(|ui| {
                         if ui
@@ -2111,18 +2672,16 @@ impl MarginaliaApp {
                     let sel = self.selected == Some(book.id);
                     row.set_selected(sel);
 
-                    if self.select_mode {
-                        row.col(|ui| {
-                            let mut on = self.checked.contains(&book.id);
-                            if ui.checkbox(&mut on, "").changed() {
-                                if on {
-                                    self.checked.insert(book.id);
-                                } else {
-                                    self.checked.remove(&book.id);
-                                }
+                    row.col(|ui| {
+                        let mut on = self.checked.contains(&book.id);
+                        if ui.checkbox(&mut on, "").changed() {
+                            if on {
+                                self.checked.insert(book.id);
+                            } else {
+                                self.checked.remove(&book.id);
                             }
-                        });
-                    }
+                        }
+                    });
                     let series = if book.series.is_empty() {
                         String::new()
                     } else if let Some(n) = book.series_index {
@@ -2147,13 +2706,26 @@ impl MarginaliaApp {
                         _ if is_updatable(&book) => "✓",
                         _ => "",
                     };
-                    let cells: [String; 7] = [
+                    // Needs-update state from the session's update checker:
+                    // ⇪ N when new chapters are ready, blank otherwise.
+                    let update_mark = match self.check_state.get(&book.id) {
+                        Some(fanficfare::CheckState::UpdateAvailable { new_chapters }) => {
+                            if *new_chapters > 0 {
+                                format!("⇪ {new_chapters}")
+                            } else {
+                                "⇪".to_string()
+                            }
+                        }
+                        _ => String::new(),
+                    };
+                    let cells: [String; 8] = [
                         title,
                         book.authors.clone(),
                         series,
                         crate::library::human_size(book.file_size),
                         crate::library::human_date(book.added_at),
                         progress,
+                        update_mark,
                         fic_mark.to_string(),
                     ];
                     for text in cells {
@@ -2640,7 +3212,9 @@ impl MarginaliaApp {
         None
     }
 
-    /// Build `(flow, pages)` for a chapter at the given geometry.
+    /// Build `(flow, pages, origins)` for a chapter at the given geometry.
+    /// `origins` parallels `flow`: the original block index and base char
+    /// offset each fragment starts at (`None` for the synthetic title).
     fn paginate(
         &self,
         ui: &mut egui::Ui,
@@ -2649,15 +3223,24 @@ impl MarginaliaApp {
         col_w: f32,
         page_h: f32,
         two_col: bool,
-    ) -> (Vec<Block>, Vec<PageDef>) {
+    ) -> (Vec<Block>, Vec<PageDef>, Vec<FlowOrigin>) {
         let mut flow = vec![Block::Heading(1, plain_spans(heading))];
         flow.extend(blocks.iter().cloned());
+        let mut origins = vec![FlowOrigin {
+            orig: None,
+            base: 0,
+        }];
+        origins.extend((0..blocks.len()).map(|idx| FlowOrigin {
+            orig: Some(idx),
+            base: 0,
+        }));
         // If the chapter opens with the same heading (common: the TOC label
         // duplicates the in-body h1/h2), drop the duplicate so the title
         // doesn't render twice.
         if let Some(Block::Heading(_, spans)) = flow.get(1) {
             if spans_plain(spans).trim() == heading.trim() {
                 flow.remove(1);
+                origins.remove(1);
             }
         }
         // Label heights/row counts parallel to `flow`, refreshed when a split
@@ -2716,10 +3299,22 @@ impl MarginaliaApp {
                     {
                         let head_m = self.measure_label(ui, &head, col_w);
                         let tail_m = self.measure_label(ui, &tail, col_w);
+                        let head_len = Self::layout_text_of(&head).chars().count();
+                        let prev = origins[i].clone();
                         flow[i] = head;
                         flow.insert(i + 1, tail);
                         mets[i] = head_m;
                         mets.insert(i + 1, tail_m);
+                        // Tail continues the same original block after the head
+                        // plus the single skipped split gap.
+                        origins[i] = prev.clone();
+                        origins.insert(
+                            i + 1,
+                            FlowOrigin {
+                                orig: prev.orig,
+                                base: prev.base.saturating_add(head_len).saturating_add(1),
+                            },
+                        );
                         // Head's trail now sees the tail fragment.
                         rem -= lead + head_m.0 + self.trail_gap(&flow, i);
                         i += 1;
@@ -2739,7 +3334,7 @@ impl MarginaliaApp {
                 split,
             });
         }
-        (flow, pages)
+        (flow, pages, origins)
     }
 
     /// Whether two page keys differ only in geometry (column width /
@@ -2898,27 +3493,6 @@ impl MarginaliaApp {
                         if ui.button("‹ Prev").clicked() {
                             self.user_prev_page();
                         }
-                        if ui
-                            .button(if self.toc_open { "TOC v" } else { "TOC >" })
-                            .clicked()
-                        {
-                            self.toc_open = !self.toc_open;
-                        }
-                        if ui
-                            .button(if self.reading_aloud {
-                                "TTS ■"
-                            } else {
-                                "TTS ▶"
-                            })
-                            .on_hover_text("read aloud (R)")
-                            .clicked()
-                        {
-                            if self.reading_aloud {
-                                self.stop_reading();
-                            } else {
-                                self.start_reading();
-                            }
-                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.scope(|ui| {
@@ -2958,9 +3532,212 @@ impl MarginaliaApp {
                 });
             });
         }
+        // Notes panel: all highlights for the book with jump/edit/delete.
+        // Deferred mutations apply after the panel borrows end.
+        let mut jump_ann: Option<i64> = None;
+        let mut del_ann: Option<i64> = None;
+        let mut edit_ann: Option<(i64, String, String)> = None;
+        if self.show_notes {
+            egui::Panel::right("notes").show(ui, |ui| {
+                ui.heading(format!("Notes ({})", self.annotations.len()));
+                if self.annotations.is_empty() {
+                    ui.weak("Select text, right-click, pick a color.");
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for ann in self.annotations.clone() {
+                        let target_ch = self.annotation_chapter(&ann);
+                        let ch_label = target_ch
+                            .and_then(|ci| {
+                                self.chapters
+                                    .get(ci)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|c| c.label.clone())
+                            })
+                            .unwrap_or_else(|| format!("Ch {}", ann.chapter_index + 1));
+                        // Unparsed target (or a still-filling book with no
+                        // target yet) reads as loading, not moved.
+                        let target_unloaded = target_ch.is_some_and(|ci| {
+                            self.chapters.get(ci).and_then(|o| o.as_ref()).is_none()
+                        }) || (target_ch.is_none()
+                            && self.chapters.iter().any(|c| c.is_none()));
+                        let orphan = !target_unloaded
+                            && target_ch
+                                .and_then(|ci| {
+                                    let texts = self.orig_texts(ci);
+                                    epub_utils::find_anchor(
+                                        &texts,
+                                        ann.start_block.max(0) as usize,
+                                        ann.start_offset.max(0) as usize,
+                                        ann.end_block.max(0) as usize,
+                                        ann.end_offset.max(0) as usize,
+                                        &ann.quote,
+                                        &ann.prefix,
+                                        &ann.suffix,
+                                    )
+                                })
+                                .is_none();
+                        let dot = match ann.color.as_str() {
+                            "green" => "🟩",
+                            "pink" => "🟪",
+                            "blue" => "🟦",
+                            _ => "🟨",
+                        };
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(dot);
+                            ui.weak(ch_label.clone());
+                            if target_unloaded {
+                                ui.weak("(loading…)");
+                            } else if orphan {
+                                ui.weak("(moved)");
+                            }
+                        });
+                        let mut snippet = ann.quote.replace('\n', " ");
+                        if snippet.chars().count() > 140 {
+                            snippet = snippet.chars().take(140).collect::<String>() + "…";
+                        }
+                        ui.label(snippet);
+                        if !ann.note.trim().is_empty() {
+                            ui.label(format!("✎ {}", ann.note));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Jump").clicked() {
+                                jump_ann = Some(ann.id);
+                            }
+                            if ui.small_button("Edit").clicked() {
+                                edit_ann = Some((ann.id, ann.color.clone(), ann.note.clone()));
+                            }
+                            if ui.small_button("Delete").clicked() {
+                                del_ann = Some(ann.id);
+                            }
+                        });
+                    }
+                });
+            });
+        }
+        if let Some(id) = del_ann {
+            let _ = self.lib.delete_annotation(id);
+            if let Some(b) = &self.reader_book {
+                self.annotations = self.lib.list_annotations(b.id).unwrap_or_default();
+            }
+            self.refresh_resolved();
+        }
+        if let Some((id, color, text)) = edit_ann {
+            self.note_edit = Some(NoteEdit { id, color, text });
+        }
+        if let Some(id) = jump_ann {
+            let target_ch = self
+                .annotations
+                .iter()
+                .find(|a| a.id == id)
+                .and_then(|a| self.annotation_chapter(a));
+            if let Some(ci) = target_ch {
+                if ci != self.current {
+                    self.user_goto_chapter(ci);
+                    self.pending_ann_jump = Some(id);
+                } else if let Some(h) = self.resolved.iter().find(|r| r.id == id) {
+                    if !h.orphan {
+                        let target = h.flow_start;
+                        if let Some(p) = self
+                            .pages
+                            .iter()
+                            .position(|pg| pg.start <= target && target < pg.end)
+                        {
+                            self.page = p;
+                            self.save_page();
+                        }
+                    }
+                }
+            }
+        }
+        // Note editor for an existing highlight (notes always attach).
+        let mut note_save: Option<(i64, String, String)> = None;
+        let mut note_close = false;
+        let mut note_delete: Option<i64> = None;
+        if let Some(mut st) = self.note_edit.clone() {
+            egui::Window::new("Note").show(ui.ctx(), |ui| {
+                ui.label("Color");
+                ui.horizontal(|ui| {
+                    for color in crate::library::ANNOTATION_COLORS {
+                        let dot = match *color {
+                            "green" => "🟩",
+                            "pink" => "🟪",
+                            "blue" => "🟦",
+                            _ => "🟨",
+                        };
+                        if ui
+                            .selectable_label(st.color == *color, dot)
+                            .on_hover_text(*color)
+                            .clicked()
+                        {
+                            st.color = (*color).to_string();
+                        }
+                    }
+                });
+                ui.label("Note");
+                ui.text_edit_multiline(&mut st.text);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        note_save = Some((st.id, st.color.clone(), st.text.clone()));
+                    }
+                    if ui.button("Delete highlight").clicked() {
+                        note_delete = Some(st.id);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        note_close = true;
+                    }
+                });
+            });
+            if note_save.is_none() && note_delete.is_none() && !note_close {
+                self.note_edit = Some(st);
+            }
+        }
+        if let Some((id, color, text)) = note_save {
+            let _ = self.lib.update_annotation(id, &color, &text);
+            if let Some(b) = &self.reader_book {
+                self.annotations = self.lib.list_annotations(b.id).unwrap_or_default();
+            }
+            self.refresh_resolved();
+            self.note_edit = None;
+        } else if let Some(id) = note_delete {
+            let _ = self.lib.delete_annotation(id);
+            if let Some(b) = &self.reader_book {
+                self.annotations = self.lib.list_annotations(b.id).unwrap_or_default();
+            }
+            self.refresh_resolved();
+            self.note_edit = None;
+        } else if note_close {
+            self.note_edit = None;
+        }
         egui::CentralPanel::default().show(ui, |ui| {
-            let Some(ch) = self.chapters.get(self.current).cloned() else {
+            if self.chapters.is_empty() {
                 ui.label("No chapters.");
+                return;
+            }
+            if self.current >= self.chapters.len() {
+                self.current = self.chapters.len() - 1;
+            }
+            // Navigation ahead of the background fill parses just this
+            // chapter (single-chapter cost); anything still missing shows a
+            // loading placeholder until its ChapterReady arrives.
+            if self
+                .chapters
+                .get(self.current)
+                .and_then(|o| o.as_ref())
+                .is_none()
+            {
+                let idx = self.current;
+                self.ensure_chapter(idx);
+            }
+            let Some(ch) = self
+                .chapters
+                .get(self.current)
+                .and_then(|o| o.as_ref())
+                .cloned()
+            else {
+                ui.label("Loading chapter…");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(120));
                 return;
             };
             let avail = ui.available_width();
@@ -3005,14 +3782,31 @@ impl MarginaliaApp {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(RESIZE_SETTLE_MS));
                 } else {
-                    let (flow, pages) =
+                    let (flow, pages, origins) =
                         self.paginate(ui, &ch.label, &ch.blocks, page_col_w, page_h, two_col);
                     self.built_two_col = two_col;
                     self.flow = flow;
+                    self.flow_origins = origins;
                     self.pages = pages;
                     self.pages_key = Some(key);
                     // Flow indices shift when splits insert fragments.
                     self.clear_selection();
+                    self.refresh_resolved();
+                    if let Some(ann_id) = self.pending_ann_jump.take() {
+                        if let Some(h) = self.resolved.iter().find(|r| r.id == ann_id) {
+                            if !h.orphan {
+                                let target = h.flow_start;
+                                if let Some(p) = self
+                                    .pages
+                                    .iter()
+                                    .position(|pg| pg.start <= target && target < pg.end)
+                                {
+                                    self.page = p;
+                                    self.save_page();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // Deferred read-aloud start (chapter spill or pre-build Read).
@@ -3083,7 +3877,10 @@ impl MarginaliaApp {
                         i.pointer.primary_released(),
                     )
                 });
-                if pressed {
+                // While a context menu is open, primary presses belong to the
+                // menu (egui dismisses it on any click). Starting a drag here
+                // would wipe the selection before the menu item runs.
+                if pressed && !self.menu_open {
                     if let Some(pos) = pointer_pos {
                         if self.pointer_in_text(pos) {
                             let col_w = self.sel_col_w;
@@ -3109,7 +3906,23 @@ impl MarginaliaApp {
                 if released && self.sel_dragging {
                     self.sel_dragging = false;
                     if self.sel_anchor == self.sel_active {
+                        // Tap (no drag): landing on a highlight opens its note
+                        // editor (view/edit the note, or delete the
+                        // highlight); anywhere else dismisses the transient
+                        // selection as before.
+                        let tapped = self
+                            .sel_anchor
+                            .and_then(|(fi, off)| self.highlight_at(fi, off));
                         self.clear_selection();
+                        if let Some(id) = tapped {
+                            if let Some(ann) = self.annotations.iter().find(|a| a.id == id) {
+                                self.note_edit = Some(NoteEdit {
+                                    id,
+                                    color: ann.color.clone(),
+                                    text: ann.note.clone(),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -3178,6 +3991,8 @@ impl MarginaliaApp {
             });
             self.sel_rects = new_rects;
             self.sel_col_w = render_col_w;
+            // Saved highlights underneath, then the active selection on top.
+            self.paint_highlights(ui, &self.sel_rects.clone(), render_col_w);
             // Selection highlight: painted after the text with a translucent
             // fill so glyphs stay legible.
             self.paint_selection(ui, &self.sel_rects.clone(), render_col_w);
@@ -3203,18 +4018,18 @@ impl MarginaliaApp {
                         ui.ctx().copy_text(text);
                     }
                 }
-                // Right-click menu with a Copy item, attached to a hover
-                // overlay so it never steals clicks from images.
+                // Right-click menu: Copy plus highlight actions. One click-sensing
+                // overlay per text block (tight rects, so image clicks still
+                // reach the lightbox). Hover-only sensing can't open a context
+                // menu: `secondary_clicked()` requires `Sense::click()`.
+                // Stable ids per block so press/release pair across frames.
+                let mut menu_open = false;
                 if self.ordered_selection().is_some() {
-                    let union = self
-                        .sel_rects
-                        .iter()
-                        .fold(egui::Rect::NOTHING, |r, b| r.union(b.rect));
-                    if union.is_positive() {
+                    for r in self.sel_rects.clone() {
                         let bg = ui.interact(
-                            union,
-                            egui::Id::unique("reader-sel-bg"),
-                            egui::Sense::hover(),
+                            r.rect,
+                            egui::Id::unique(("reader-sel-bg", r.flow_idx)),
+                            egui::Sense::click(),
                         );
                         bg.context_menu(|ui| {
                             if ui.button("Copy").clicked() {
@@ -3224,9 +4039,33 @@ impl MarginaliaApp {
                                 }
                                 ui.close();
                             }
+                            ui.separator();
+                            ui.label("Highlight");
+                            ui.horizontal(|ui| {
+                                for color in crate::library::ANNOTATION_COLORS {
+                                    let dot = match *color {
+                                        "green" => "🟩",
+                                        "pink" => "🟪",
+                                        "blue" => "🟦",
+                                        _ => "🟨",
+                                    };
+                                    if ui.small_button(dot).on_hover_text(*color).clicked() {
+                                        self.highlight_selection(color, false);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if ui.button("Highlight + note…").clicked() {
+                                self.highlight_selection("yellow", true);
+                                ui.close();
+                            }
                         });
+                        menu_open |= bg.context_menu_opened();
                     }
                 }
+                // Previous frame's state drives the press guard above; store
+                // this frame's for next time.
+                self.menu_open = menu_open;
             }
         });
         self.show_lightbox(ui.ctx());
@@ -3350,21 +4189,29 @@ mod tests {
             sort: SortKey::Recent,
             sort_reverse: false,
             selected: None,
-            select_mode: false,
             checked: std::collections::HashSet::new(),
             delete_confirm: None,
             view: View::Library,
             reader_book: None,
             toc: vec![],
             chapters: vec![],
+            chapter_hrefs: vec![],
+            reader_gen: 0,
             current: 0,
             page: 0,
             pages: vec![],
             flow: vec![],
+            flow_origins: vec![],
             pages_key: None,
             last_content_w: 0.0,
             last_page_h: 0.0,
             toc_open: false,
+            show_notes: false,
+            annotations: vec![],
+            resolved: vec![],
+            note_edit: None,
+            pending_ann_jump: None,
+            menu_open: false,
             font_size: saved_display.font_size,
             font_weight: saved_display.font_weight,
             reader_font: saved_display.font_family.clone(),
@@ -3422,7 +4269,7 @@ mod tests {
         col_w: f32,
         page_h: f32,
         two_col: bool,
-    ) -> (Vec<Block>, Vec<PageDef>) {
+    ) -> (Vec<Block>, Vec<PageDef>, Vec<FlowOrigin>) {
         let ctx = egui::Context::default();
         fonts::install(&ctx);
         // run_ui borrows app immutably; stash the owned result via RefCell.
@@ -3446,7 +4293,7 @@ mod tests {
     fn pages_split_long_paragraphs() {
         let app = fixture_app();
         let blocks = long_chapter();
-        let (flow, pages) = paginate_case(&app, &blocks, 500.0, 400.0, false);
+        let (flow, pages, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
         assert!(pages.len() > 1, "long chapter must paginate");
         // Coverage: pages tile the flow exactly, in order, none empty.
         let mut cursor = 0;
@@ -3465,7 +4312,7 @@ mod tests {
     fn two_column_pages_stay_ordered() {
         let app = fixture_app();
         let blocks = long_chapter();
-        let (flow, pages) = paginate_case(&app, &blocks, 350.0, 400.0, true);
+        let (flow, pages, _) = paginate_case(&app, &blocks, 350.0, 400.0, true);
         assert!(pages.len() > 1);
         let mut cursor = 0;
         for p in &pages {
@@ -3491,7 +4338,7 @@ mod tests {
             Block::Paragraph(plain_spans(("Tail. ".repeat(200)).trim())),
         ];
         for two_col in [false, true] {
-            let (flow, pages) = paginate_case(&app, &blocks, 500.0, 420.0, two_col);
+            let (flow, pages, _) = paginate_case(&app, &blocks, 500.0, 420.0, two_col);
             assert!(!pages.is_empty());
             let mut cursor = 0;
             for p in &pages {
@@ -3511,7 +4358,7 @@ mod tests {
     #[test]
     fn empty_chapter_is_one_page() {
         let app = fixture_app();
-        let (flow, pages) = paginate_case(&app, &[], 500.0, 400.0, false);
+        let (flow, pages, _) = paginate_case(&app, &[], 500.0, 400.0, false);
         assert_eq!(flow.len(), 1);
         assert_eq!(pages.len(), 1);
         assert_eq!((pages[0].start, pages[0].end), (0, 1));
@@ -3699,7 +4546,7 @@ mod tests {
             Block::Heading(2, plain_spans("Chapter")),
             Block::Paragraph(plain_spans("Body text here.")),
         ];
-        let (flow, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
+        let (flow, _, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
         assert!(matches!(&flow[0], Block::Heading(1, t) if spans_plain(t) == "Chapter"));
         assert!(matches!(&flow[1], Block::Paragraph(_)));
     }
@@ -3711,7 +4558,7 @@ mod tests {
             Block::Heading(2, plain_spans("A Section Inside")),
             Block::Paragraph(plain_spans("Body text here.")),
         ];
-        let (flow, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
+        let (flow, _, _) = paginate_case(&app, &blocks, 500.0, 400.0, false);
         assert!(matches!(&flow[0], Block::Heading(1, t) if spans_plain(t) == "Chapter"));
         assert!(matches!(&flow[1], Block::Heading(2, t) if spans_plain(t) == "A Section Inside"));
     }
@@ -3742,15 +4589,19 @@ mod tests {
             progress_page: 0,
         });
         app.chapters = (0..3)
-            .map(|i| Chapter {
-                index: i,
-                label: format!("Chapter {}", i + 1),
-                blocks: vec![
-                    Block::Paragraph(plain_spans(("Some body text here. ".repeat(120)).trim())),
-                    Block::Paragraph(plain_spans(("More body text here. ".repeat(120)).trim())),
-                ],
+            .map(|i| {
+                Some(Chapter {
+                    index: i,
+                    label: format!("Chapter {}", i + 1),
+                    href: format!("ch{i}.xhtml"),
+                    blocks: vec![
+                        Block::Paragraph(plain_spans(("Some body text here. ".repeat(120)).trim())),
+                        Block::Paragraph(plain_spans(("More body text here. ".repeat(120)).trim())),
+                    ],
+                })
             })
             .collect();
+        app.chapter_hrefs = (0..3).map(|i| format!("ch{i}.xhtml")).collect();
         app.toc = vec![];
         app.current = 1;
         app.page = 0;
@@ -3886,10 +4737,236 @@ mod tests {
         // draws both columns, leaving the second empty.
         let app = fixture_app();
         let blocks = vec![Block::Paragraph(plain_spans("Tiny."))];
-        let (flow, pages) = paginate_case(&app, &blocks, 350.0, 400.0, true);
+        let (flow, pages, _) = paginate_case(&app, &blocks, 350.0, 400.0, true);
         assert_eq!(pages.len(), 1);
         assert!(pages[0].split.is_none());
         assert_eq!((pages[0].start, pages[0].end), (0, flow.len()));
+    }
+
+    #[test]
+    fn origins_map_unsplit_and_split_ranges() {
+        let app = fixture_app();
+        let blocks = long_chapter();
+        let (flow, _, origins) = paginate_case(&app, &blocks, 500.0, 400.0, false);
+        assert_eq!(flow.len(), origins.len());
+        // Synthetic title first, then original blocks in order.
+        assert_eq!(origins[0].orig, None);
+        assert!(origins[1..].iter().all(|o| o.orig.is_some()));
+        // Round-trip an unsplit offset through a test harness app.
+        let mut harness = fixture_app();
+        harness.chapters = vec![Some(Chapter {
+            index: 0,
+            label: "Chapter".to_string(),
+            href: "ch0.xhtml".to_string(),
+            blocks: blocks.clone(),
+        })];
+        harness.chapter_hrefs = vec!["ch0.xhtml".to_string()];
+        harness.flow = flow.clone();
+        harness.flow_origins = origins.clone();
+        harness.current = 0;
+        // Original block 0 maps to at least one flow fragment; converting the
+        // first flow fragment's start maps back to original block 0 offset 0.
+        let first_real = harness
+            .flow_origins
+            .iter()
+            .position(|o| o.orig == Some(0))
+            .unwrap();
+        assert_eq!(harness.flow_to_orig(first_real, 0), Some((0, 0)));
+        // A mid-block original offset lands inside the same original block.
+        let texts: Vec<String> = blocks.iter().map(epub_utils::anchor_text).collect();
+        let mid = texts[0].chars().count() / 2;
+        let mapped = harness.map_orig_to_flow(0, mid, 0, mid + 5).unwrap();
+        assert_eq!(harness.flow_origins[mapped.0].orig, Some(0));
+        // Multi-block ranges span flow order.
+        let mapped = harness.map_orig_to_flow(0, 0, 1, 3).unwrap();
+        assert!(mapped.2 >= mapped.0);
+    }
+
+    #[test]
+    fn selection_overlay_senses_right_click() {
+        // Regression: the reader's selection menu overlay used Sense::hover(),
+        // which can never report secondary_clicked(), so right-click never
+        // opened the Copy/Highlight menu. Per-block overlays must sense clicks.
+        fn secondary_clicked_with(sense: egui::Sense) -> bool {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(200.0, 20.0));
+            let pos = egui::pos2(150.0, 110.0);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let frame = |pressed: bool| egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let hit = std::cell::Cell::new(false);
+            let interact_once = |input: egui::RawInput| {
+                let mut full = ctx.run_ui(input, |ui| {
+                    let r = ui.interact(rect, egui::Id::unique("test-sel-bg"), sense);
+                    hit.set(r.secondary_clicked());
+                });
+                full.textures_delta.clear();
+            };
+            // Warm-up: register the widget so later frames hit-test against it
+            // (egui resolves interactions from the previous pass's widgets;
+            // the reader overlay is re-registered every frame, so this only
+            // matters for the test).
+            interact_once(frame(true));
+            // Press...
+            interact_once(frame(true));
+            if hit.get() {
+                return true;
+            }
+            // ...and release next frame: a click registers on release.
+            interact_once(frame(false));
+            hit.get()
+        }
+        assert!(secondary_clicked_with(egui::Sense::click()));
+        assert!(!secondary_clicked_with(egui::Sense::hover()));
+    }
+
+    /// Drive one reader frame on a shared context (a single persistent
+    /// `Context` like the real app: panel sizes and interaction state settle
+    /// instead of re-converging every frame).
+    fn run_reader_frame_on(ctx: &egui::Context, app: &mut MarginaliaApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut full = ctx.run_ui(input, |ui| {
+            app.ui_reader(ui);
+        });
+        full.textures_delta.clear();
+    }
+
+    /// Drive a primary-button tap (press + release) at `pos` through full
+    /// reader frames, e.g. as when clicking a context-menu item over text.
+    /// Each frame uses a fresh context like the other headless tests, so
+    /// geometry stays at its deterministic fallback and no reflow intervenes;
+    /// the selection state itself lives in the app across frames.
+    fn tap_text(app: &mut MarginaliaApp, pos: egui::Pos2) {
+        for pressed in [true, false] {
+            run_reader_frame_on(
+                &egui::Context::default(),
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn menu_open_preserves_selection_on_tap() {
+        // Clicking a context-menu item is a primary tap over the text. Before
+        // the menu-open guard, that tap restarted the selection at the tap
+        // point and the release cleared it, so every menu action ran on an
+        // empty selection (the menu just disappeared).
+        let mut app = reading_app();
+        run_reader_frame(&mut app);
+        assert!(!app.sel_rects.is_empty());
+        let target = app.sel_rects[0].flow_idx;
+        let pos = app.sel_rects[0].rect.center();
+        // Menu open: the tap must not disturb the selection it acts on.
+        app.sel_anchor = Some((target, 0));
+        app.sel_active = Some((target, 5));
+        app.menu_open = true;
+        tap_text(&mut app, pos);
+        assert_eq!(app.sel_anchor, Some((target, 0)));
+        assert_eq!(app.sel_active, Some((target, 5)));
+        // Menu closed: the same tap restarts the selection at the tap point,
+        // and the release clears the zero-width tap — normal behavior.
+        app.sel_anchor = Some((target, 0));
+        app.sel_active = Some((target, 5));
+        app.menu_open = false;
+        tap_text(&mut app, pos);
+        assert!(app.sel_anchor.is_none() && app.sel_active.is_none());
+    }
+
+    #[test]
+    fn tap_highlight_opens_note_editor() {
+        // Tapping a highlight opens its note (view/edit, or delete the
+        // highlight from the editor); tapping plain text just clears.
+        let mut app = reading_app();
+        // `fixture_app` drops its tempdir: swap in a live library so
+        // annotation CRUD hits a real database.
+        let tmp = tempfile::tempdir().unwrap();
+        app.lib = Library::open(tmp.path().join("lib")).unwrap();
+        app.chapters = vec![Some(Chapter {
+            index: 0,
+            label: "Short".to_string(),
+            href: "ch0.xhtml".to_string(),
+            blocks: vec![Block::Paragraph(plain_spans(
+                "Alpha beta gamma delta epsilon.",
+            ))],
+        })];
+        app.chapter_hrefs = vec!["ch0.xhtml".to_string()];
+        app.current = 0;
+        app.page = 0;
+        run_reader_frame(&mut app);
+        let para = app
+            .sel_rects
+            .iter()
+            .find(|r| r.flow_idx == 1)
+            .expect("paragraph rect");
+        let pos = para.rect.center();
+        // Highlight the whole paragraph with a note.
+        let texts: Vec<String> = app.chapters[0]
+            .as_ref()
+            .expect("chapter")
+            .blocks
+            .iter()
+            .map(epub_utils::anchor_text)
+            .collect();
+        let len = texts[0].chars().count();
+        let quote = epub_utils::anchor_range_text(&texts, 0, 0, 0, len);
+        let ann = app
+            .lib
+            .add_annotation(
+                1,
+                "ch0.xhtml",
+                0,
+                0,
+                0,
+                0,
+                len as i64,
+                "pink",
+                "a note",
+                &quote,
+                "",
+                "",
+            )
+            .unwrap();
+        app.load_annotations();
+        assert!(app.resolved.iter().any(|r| r.id == ann.id && !r.orphan));
+        // Tap the highlight: selection clears and the editor opens.
+        tap_text(&mut app, pos);
+        assert!(app.sel_anchor.is_none() && app.sel_active.is_none());
+        let edit = app.note_edit.clone().expect("editor opens");
+        assert_eq!(edit.id, ann.id);
+        assert_eq!(edit.text, "a note");
+        // Tap the title (not highlighted): no editor.
+        app.note_edit = None;
+        let title_pos = app.sel_rects[0].rect.center();
+        tap_text(&mut app, title_pos);
+        assert!(app.note_edit.is_none());
+        assert!(app.sel_anchor.is_none() && app.sel_active.is_none());
     }
 
     fn fixture_book(id: i64, title: &str, fanfic_url: Option<&str>) -> Book {
@@ -3919,7 +4996,6 @@ mod tests {
     #[test]
     fn select_all_covers_filtered_view_only() {
         let mut app = fixture_app();
-        app.select_mode = true;
         app.books = vec![
             fixture_book(1, "A", None),
             fixture_book(2, "B", None),
@@ -3939,7 +5015,6 @@ mod tests {
     #[test]
     fn ask_delete_checked_sorts_and_counts_off_filter() {
         let mut app = fixture_app();
-        app.select_mode = true;
         app.books = vec![
             fixture_book(2, "Zulu", None),
             fixture_book(1, "Alpha", None),
@@ -3978,9 +5053,58 @@ mod tests {
     }
 
     #[test]
+    fn needs_update_sort_tiers_and_tiebreak() {
+        let mut books = vec![
+            fixture_book(1, "Untracked", None),
+            fixture_book(2, "UpToDate", Some("https://example.com/works/1")),
+            fixture_book(3, "Unchecked", Some("https://example.com/works/2")),
+            fixture_book(4, "FewNew", Some("https://example.com/works/3")),
+            fixture_book(5, "ManyNew", Some("https://example.com/works/4")),
+        ];
+        let states: HashMap<i64, fanficfare::CheckState> = HashMap::from([
+            (2, fanficfare::CheckState::UpToDate),
+            (
+                4,
+                fanficfare::CheckState::UpdateAvailable { new_chapters: 2 },
+            ),
+            (
+                5,
+                fanficfare::CheckState::UpdateAvailable { new_chapters: 9 },
+            ),
+        ]);
+        sort_by_update(&mut books, &states);
+        // Updates first (most new chapters first), then unchecked tracked,
+        // then up to date, then untracked.
+        let ids: Vec<i64> = books.iter().map(|b| b.id).collect();
+        assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+        // Tier ranks directly.
+        assert_eq!(update_rank(&fixture_book(1, "U", None), None), 3);
+        assert_eq!(
+            update_rank(
+                &fixture_book(1, "U", Some("https://example.com/works/1")),
+                None
+            ),
+            1
+        );
+        assert_eq!(
+            update_rank(
+                &fixture_book(1, "U", Some("https://example.com/works/1")),
+                Some(&fanficfare::CheckState::UpToDate)
+            ),
+            2
+        );
+        assert_eq!(
+            update_rank(
+                &fixture_book(1, "U", Some("https://example.com/works/1")),
+                Some(&fanficfare::CheckState::UpdateAvailable { new_chapters: 1 })
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn check_selected_needs_tracked_selection() {
         let mut app = fixture_app();
-        app.select_mode = true;
         // Checked id resolves to nothing: no tracked fics selected.
         app.checked = std::collections::HashSet::from([1]);
         app.start_check_selected();

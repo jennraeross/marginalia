@@ -1,4 +1,4 @@
-use epub::doc::{EpubDoc, NavPoint};
+use crate::epub_core::{EpubDoc, NavPoint};
 use scraper::{Html, Selector};
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,9 @@ pub enum Block {
 pub struct Chapter {
     pub index: usize,
     pub label: String,
+    /// Stable spine href (forward-slash archive path) for annotation anchoring
+    /// across re-imports. Falls back to `spine{i}` when unknown.
+    pub href: String,
     pub blocks: Vec<Block>,
 }
 
@@ -80,6 +83,87 @@ pub struct TocEntry {
 pub fn chapter_count(path: &Path) -> Option<usize> {
     let doc = EpubDoc::new(path).ok()?;
     Some(doc.get_num_chapters())
+}
+
+/// Spine hrefs + TOC without parsing chapter HTML. Cheap enough to run on the
+/// UI thread: no chapter bodies are touched, so opening a book only pays for
+/// the zip/opf/nav walk. The returned hrefs are positional (index `i` is
+/// spine `i`); a chapter that can't be selected gets a `spine{i}` placeholder.
+pub fn book_skeleton(path: &Path) -> Result<(Vec<TocEntry>, Vec<String>), String> {
+    let mut doc = EpubDoc::new(path).map_err(|e| format!("cannot open epub: {e}"))?;
+    let n = doc.get_num_chapters();
+    let mut hrefs = Vec::with_capacity(n);
+    for i in 0..n {
+        if doc.set_current_chapter(i) {
+            let ch_path = doc.get_current_path().unwrap_or_default();
+            hrefs.push(canon_path(&ch_path));
+        } else {
+            hrefs.push(format!("spine{i}"));
+        }
+    }
+    let mut toc = Vec::new();
+    flatten_toc(&doc.toc, 0, &doc, &mut toc);
+    Ok((toc, hrefs))
+}
+
+/// First non-blank TOC label pointing at spine `idx`, if any. Mirrors the
+/// first-wins rule `load_book` applies when labelling chapters.
+pub fn toc_label_for(toc: &[TocEntry], idx: usize) -> Option<String> {
+    toc.iter().find_map(|t| {
+        if t.chapter == Some(idx) {
+            let label = t.label.trim();
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+        }
+        None
+    })
+}
+
+/// Parse a single spine chapter. Labelling mirrors `load_book`: the nav label
+/// wins when present; chapters with no nav entry fall back to their first
+/// heading (stripped, as in `load_book`) or `Chapter N`. When the book has no
+/// nav TOC at all, headings are kept: `load_book` would have mapped them via
+/// its heading fallback, and the reader removes the duplicate title at
+/// pagination time.
+pub fn load_chapter(path: &Path, idx: usize, toc: &[TocEntry]) -> Result<Chapter, String> {
+    let mut doc = EpubDoc::new(path).map_err(|e| format!("cannot open epub: {e}"))?;
+    parse_chapter(&mut doc, idx, toc)
+}
+
+fn parse_chapter(doc: &mut EpubDoc, idx: usize, toc: &[TocEntry]) -> Result<Chapter, String> {
+    if !doc.set_current_chapter(idx) {
+        return Err(format!("no chapter {idx}"));
+    }
+    let (html, _mime) = doc.get_current_str().unwrap_or_default();
+    let ch_path = doc.get_current_path().unwrap_or_default();
+    let mut resolve = |src: &str| resolve_resource(doc, &ch_path, src);
+    let mut blocks = html_to_blocks(&html, &mut resolve);
+    let href = canon_path(&ch_path);
+    let clean = toc_label_for(toc, idx);
+    let mapped = clean.is_some();
+    let mut label = clean.unwrap_or_default();
+    if !mapped {
+        label = format!("Chapter {}", idx + 1);
+        if let Some(Block::Heading(_, spans)) = blocks.first() {
+            if !spans_plain(spans).trim().is_empty() {
+                label = spans_plain(spans).trim().to_string();
+                // No nav TOC: the heading fallback would have mapped this
+                // chapter, so keep its heading like `load_book` does (the
+                // reader drops the duplicate title at pagination time).
+                // With a nav TOC, unmapped chapters lose the heading.
+                if !toc.is_empty() {
+                    blocks.remove(0);
+                }
+            }
+        }
+    }
+    Ok(Chapter {
+        index: idx,
+        label,
+        href,
+        blocks,
+    })
 }
 
 pub fn load_book(path: &Path) -> Result<(Vec<TocEntry>, Vec<Chapter>), String> {
@@ -97,6 +181,7 @@ pub fn load_book(path: &Path) -> Result<(Vec<TocEntry>, Vec<Chapter>), String> {
         chapters.push(Chapter {
             index: i,
             label: format!("Chapter {}", i + 1),
+            href: canon_path(&ch_path),
             blocks,
         });
     }
@@ -156,13 +241,7 @@ pub fn load_book(path: &Path) -> Result<(Vec<TocEntry>, Vec<Chapter>), String> {
     Ok((toc, chapters))
 }
 
-fn flatten_toc(
-    points: &[NavPoint],
-    depth: usize,
-    doc: &EpubDoc<std::io::BufReader<std::fs::File>>,
-    out: &mut Vec<TocEntry>,
-) {
-    // EpubDoc generic over reader; use a helper via resource lookup done by caller path mapping.
+fn flatten_toc(points: &[NavPoint], depth: usize, doc: &EpubDoc, out: &mut Vec<TocEntry>) {
     // We resolve chapter by trying resource_uri_to_chapter on content path.
     for p in points {
         let chapter = doc.resource_uri_to_chapter(&p.content);
@@ -177,12 +256,7 @@ fn flatten_toc(
     }
 }
 
-fn flatten_toc_inner(
-    points: &[NavPoint],
-    depth: usize,
-    doc: &EpubDoc<std::io::BufReader<std::fs::File>>,
-    out: &mut Vec<TocEntry>,
-) {
+fn flatten_toc_inner(points: &[NavPoint], depth: usize, doc: &EpubDoc, out: &mut Vec<TocEntry>) {
     for p in points {
         let chapter = doc.resource_uri_to_chapter(&p.content);
         out.push(TocEntry {
@@ -216,6 +290,234 @@ pub fn block_plain(b: &Block) -> String {
         // Images carry no text (their alt text renders separately, if at all).
         Block::Image { .. } => String::new(),
     }
+}
+
+/// Anchor text for highlights: what hit-testing and painting measure.
+/// List items include the rendered bullet prefix so offsets match the reader.
+pub fn anchor_text(b: &Block) -> String {
+    match b {
+        Block::ListItem(spans) => format!("• {}", spans_plain(spans)),
+        Block::Heading(_, spans) | Block::Paragraph(spans) | Block::Quote(spans) => {
+            spans_plain(spans)
+        }
+        Block::Pre(t) => t.clone(),
+        Block::Image { .. } => String::new(),
+    }
+}
+
+/// Char-index slice of `s`, clamped. Never panics on multi-byte boundaries.
+pub fn slice_chars(s: &str, start: usize, end: usize) -> String {
+    let (lo, hi) = (start.min(end), start.max(end));
+    s.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+}
+
+fn clamp_range(len: usize, start: usize, end: usize) -> (usize, usize) {
+    let (mut s, mut e) = (start.min(end), start.max(end));
+    s = s.min(len);
+    e = e.min(len);
+    (s, e)
+}
+
+/// Display text of an anchor range: trimmed non-empty pieces joined with a
+/// blank line, mirroring the reader's copy behavior.
+pub fn anchor_range_text(texts: &[String], sb: usize, so: usize, eb: usize, eo: usize) -> String {
+    if texts.is_empty() {
+        return String::new();
+    }
+    let (sb, eb) = (sb.min(eb.max(sb)), eb);
+    let last = eb.min(texts.len().saturating_sub(1));
+    let mut parts = Vec::new();
+    for (idx, t) in texts
+        .iter()
+        .enumerate()
+        .skip(sb)
+        .take(last.saturating_sub(sb) + 1)
+    {
+        let len = t.chars().count();
+        let (s, e) = if sb == eb {
+            clamp_range(len, so, eo)
+        } else if idx == sb {
+            (so.min(len), len)
+        } else if idx == eb {
+            (0, eo.min(len))
+        } else {
+            (0, len)
+        };
+        let piece = slice_chars(t, s, e);
+        if !piece.trim().is_empty() {
+            parts.push(piece.trim().to_string());
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Context overlap score: chars of `prefix` matching backwards plus chars of
+/// `suffix` matching forwards (max 32+32).
+fn context_score(text: &str, pos: usize, needle_len: usize, prefix: &str, suffix: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut score = 0;
+    let pre: Vec<char> = prefix.chars().collect();
+    let suf: Vec<char> = suffix.chars().collect();
+    let take_pre = pre.len().min(32).min(pos);
+    for i in 0..take_pre {
+        if chars[pos - 1 - i] == pre[pre.len() - 1 - i] {
+            score += 1;
+        } else {
+            break;
+        }
+    }
+    let after = pos + needle_len;
+    let take_suf = suf.len().min(32).min(chars.len().saturating_sub(after));
+    for i in 0..take_suf {
+        if chars[after + i] == suf[i] {
+            score += 1;
+        } else {
+            break;
+        }
+    }
+    score
+}
+
+fn best_in_text(text: &str, needle: &str, prefix: &str, suffix: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() || text.is_empty() {
+        return None;
+    }
+    let t: Vec<char> = text.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || t.len() < n.len() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i + n.len() <= t.len() {
+        if t[i..i + n.len()] == n[..] {
+            let s = context_score(text, i, n.len(), prefix, suffix);
+            let better = match best {
+                None => true,
+                Some((_, bs)) => s > bs,
+            };
+            if better {
+                best = Some((i, s));
+                if s == 64 {
+                    break;
+                }
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    best.map(|(pos, _)| (pos, pos + n.len()))
+}
+
+/// Relocate an annotation range inside `texts` (anchor texts of one chapter).
+/// Exact stored offsets win when they reproduce `quote`; otherwise fuzzy
+/// quote search with prefix/suffix disambiguation. Returns layout offsets.
+#[allow(clippy::too_many_arguments)]
+pub fn find_anchor(
+    texts: &[String],
+    start_block: usize,
+    start_offset: usize,
+    end_block: usize,
+    end_offset: usize,
+    quote: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<(usize, usize, usize, usize)> {
+    if texts.is_empty() || quote.trim().is_empty() {
+        return None;
+    }
+    // Exact fast path.
+    if start_block < texts.len() && end_block < texts.len() && start_block <= end_block {
+        let reproduced = anchor_range_text(texts, start_block, start_offset, end_block, end_offset);
+        if reproduced == quote {
+            let sb_len = texts[start_block].chars().count();
+            let eb_len = texts[end_block].chars().count();
+            let (ss, _) = clamp_range(sb_len, start_offset, start_offset);
+            let (_, ee) = clamp_range(eb_len, end_offset, end_offset);
+            let (s, e) = (ss.min(sb_len), ee.min(eb_len));
+            if start_block == end_block && s >= e {
+                // Empty after clamping: fall through to fuzzy.
+            } else {
+                return Some((start_block, s, end_block, e));
+            }
+        }
+    }
+    let pieces: Vec<&str> = quote.split("\n\n").collect();
+    if pieces.len() == 1 {
+        let piece = pieces[0];
+        let needles = if piece.chars().count() > 64 {
+            // Long quote: try full, then a distinctive middle slice.
+            let chars: Vec<char> = piece.chars().collect();
+            let mid = chars.len() / 2;
+            let lo = mid.saturating_sub(16);
+            vec![
+                piece.to_string(),
+                chars[lo..(lo + 32).min(chars.len())].iter().collect(),
+            ]
+        } else {
+            vec![piece.to_string()]
+        };
+        for needle in needles {
+            let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+            for (bi, t) in texts.iter().enumerate() {
+                if let Some((s, e)) = best_in_text(t, &needle, prefix, suffix) {
+                    let sc = context_score(t, s, needle.chars().count(), prefix, suffix);
+                    let better = match best {
+                        None => true,
+                        Some((_, _, _, _, bs)) => sc > bs,
+                    };
+                    if better {
+                        best = Some((bi, s, bi, e, sc));
+                    }
+                }
+            }
+            if let Some((sb, so, eb, eo, _)) = best {
+                return Some((sb, so, eb, eo));
+            }
+        }
+        return None;
+    }
+    // Multi-block: anchor on first and last pieces.
+    let first = pieces[0];
+    let last = pieces[pieces.len() - 1];
+    let first_needle: String = first.chars().take(64).collect();
+    let last_needle: String = {
+        let c: Vec<char> = last.chars().collect();
+        c[c.len().saturating_sub(64)..].iter().collect()
+    };
+    let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+    for (sbi, st) in texts.iter().enumerate() {
+        let Some((ss, _)) = best_in_text(st, &first_needle, prefix, "") else {
+            continue;
+        };
+        for (ebi, et) in texts.iter().enumerate().skip(sbi) {
+            let search_suffix = if ebi == sbi { "" } else { suffix };
+            if let Some((_, ee)) = best_in_text(et, &last_needle, "", search_suffix) {
+                // End offset is end of the matched needle.
+                let sc = context_score(st, ss, first_needle.chars().count(), prefix, "")
+                    + context_score(
+                        et,
+                        ee - last_needle.chars().count(),
+                        last_needle.chars().count(),
+                        "",
+                        suffix,
+                    );
+                let better = match best {
+                    None => true,
+                    Some((_, _, _, _, bs)) => sc > bs,
+                };
+                if better {
+                    // Start at match start; end at match end. For the common
+                    // case where the piece equals the block slice, this is exact.
+                    let (_, send) = best_in_text(et, &last_needle, "", search_suffix).unwrap();
+                    best = Some((sbi, ss, ebi, send, sc));
+                }
+                break;
+            }
+        }
+    }
+    best.map(|(sb, so, eb, eo, _)| (sb, so, eb, eo))
 }
 
 /// Parse chapter HTML into blocks. `lookup` resolves an `<img src>` value to
@@ -882,8 +1184,8 @@ pub(crate) fn percent_decode(s: &str) -> String {
 /// Tries the literal location first, then a percent-decoded variant, then a
 /// unique file-name match among the manifest resources (some producers use
 /// inconsistent path forms). Returns `None` for remote URLs.
-pub(crate) fn resolve_resource<R: std::io::Read + std::io::Seek>(
-    doc: &mut EpubDoc<R>,
+pub(crate) fn resolve_resource(
+    doc: &mut EpubDoc,
     chapter_path: &Path,
     src: &str,
 ) -> Option<Vec<u8>> {
@@ -1378,5 +1680,120 @@ mod tests {
         assert_eq!(percent_decode("%41%42"), "AB");
         assert_eq!(percent_decode("100%.png"), "100%.png");
         assert_eq!(percent_decode("a%2Fb"), "a/b");
+    }
+
+    fn anchor_texts(blocks: &[Block]) -> Vec<String> {
+        blocks.iter().map(anchor_text).collect()
+    }
+
+    #[test]
+    fn anchor_exact_and_fuzzy() {
+        let blocks = vec![
+            Block::Paragraph(plain_spans("The quick brown fox jumps.")),
+            Block::Paragraph(plain_spans("Lazy dogs sleep all day.")),
+        ];
+        let texts = anchor_texts(&blocks);
+        // Exact offsets reproduce the quote.
+        let quote = anchor_range_text(&texts, 0, 4, 0, 9);
+        assert_eq!(quote, "quick");
+        let found = find_anchor(&texts, 0, 4, 0, 9, &quote, "The ", " brown").unwrap();
+        assert_eq!(found, (0, 4, 0, 9));
+        // Edited text: exact fails, fuzzy finds the surviving word.
+        let edited = vec![
+            "The quick red fox jumps.".to_string(),
+            "Lazy dogs sleep all day.".to_string(),
+        ];
+        let found = find_anchor(&edited, 0, 4, 0, 9, &quote, "The ", " brown").unwrap();
+        assert_eq!((found.0, found.2), (0, 0));
+        assert_eq!(slice_chars(&edited[0], found.1, found.3), "quick");
+        // Empty quote never resolves.
+        assert!(find_anchor(&texts, 0, 0, 0, 3, "", "", "").is_none());
+    }
+
+    #[test]
+    fn anchor_multi_block_and_orphan() {
+        let blocks = vec![
+            Block::Paragraph(plain_spans("Alpha beta gamma.")),
+            Block::Paragraph(plain_spans("Delta epsilon zeta.")),
+            Block::Paragraph(plain_spans("Eta theta iota.")),
+        ];
+        let texts = anchor_texts(&blocks);
+        let quote = anchor_range_text(&texts, 0, 6, 2, 9);
+        assert!(quote.contains("beta") && quote.contains("theta"));
+        let found = find_anchor(&texts, 0, 6, 2, 9, &quote, "Alpha ", " iota.").unwrap();
+        assert_eq!((found.0, found.2), (0, 2));
+        // Fully rewritten chapter orphans the quote.
+        let gone = vec!["Nothing alike here.".to_string()];
+        assert!(find_anchor(&gone, 0, 6, 2, 9, &quote, "Alpha ", " iota.").is_none());
+    }
+
+    /// Minimal 3-chapter EPUB on disk (no NCX, so no nav TOC).
+    fn fixture_epub(path: &std::path::Path) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#).unwrap();
+        for (name, body) in [
+            (
+                "OEBPS/c0.xhtml",
+                "<h1>Title One</h1><p>First chapter text here.</p>",
+            ),
+            ("OEBPS/c1.xhtml", "<p>Second chapter, no heading.</p>"),
+            (
+                "OEBPS/c2.xhtml",
+                "<h2>Third Part</h2><p>Third chapter text here.</p>",
+            ),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(
+                format!(
+                    r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn lazy_single_chapter_matches_full_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.epub");
+        fixture_epub(&path);
+        let (toc_full, chapters_full) = load_book(&path).unwrap();
+        assert_eq!(chapters_full.len(), 3);
+        let (toc_skel, hrefs) = book_skeleton(&path).unwrap();
+        assert_eq!(hrefs.len(), chapters_full.len());
+        // Skeleton is stable without chapter bodies: same hrefs. It carries
+        // only the nav TOC (empty here); the heading fallback is built by the
+        // reader once all chapters are in.
+        for (i, ch) in chapters_full.iter().enumerate() {
+            assert_eq!(hrefs[i], ch.href);
+        }
+        assert!(toc_skel.is_empty());
+        assert_eq!(toc_full.len(), 2);
+        // Each lazy chapter matches its full-parse counterpart exactly
+        // (labels incl. heading adoption, hrefs, block text).
+        for (i, full) in chapters_full.iter().enumerate() {
+            let ch = load_chapter(&path, i, &toc_skel).unwrap();
+            assert_eq!(ch.index, i);
+            assert_eq!(ch.label, full.label);
+            assert_eq!(ch.href, full.href);
+            assert_eq!(anchor_texts(&ch.blocks), anchor_texts(&full.blocks));
+        }
+        // Heading-led chapter adopts its title; heading-less keeps Chapter N.
+        assert_eq!(chapters_full[0].label, "Title One");
+        assert_eq!(chapters_full[2].label, "Third Part");
     }
 }

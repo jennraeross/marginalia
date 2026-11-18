@@ -1,5 +1,5 @@
+use crate::epub_core::EpubDoc;
 use chrono::Utc;
-use epub::doc::EpubDoc;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -42,6 +42,9 @@ pub enum SortKey {
     Added,
     Size,
     Progress,
+    /// Session update-check state (computed in memory; see `update_rank`).
+    /// `list()` falls back to `Recent` order within each tier.
+    NeedsUpdate,
 }
 
 impl SortKey {
@@ -55,6 +58,7 @@ impl SortKey {
             ("Added", SortKey::Added),
             ("Size", SortKey::Size),
             ("Progress", SortKey::Progress),
+            ("Update", SortKey::NeedsUpdate),
         ]
     }
     pub fn label(self) -> &'static str {
@@ -67,6 +71,7 @@ impl SortKey {
             SortKey::Added => "Added",
             SortKey::Size => "Size",
             SortKey::Progress => "Progress",
+            SortKey::NeedsUpdate => "Update",
         }
     }
 }
@@ -99,6 +104,37 @@ impl Default for DisplaySettings {
             theme: "default-dark".to_string(),
         }
     }
+}
+
+/// Fixed highlight palette ids. Notes always attach to a highlight range.
+pub const ANNOTATION_COLORS: &[&str] = &["yellow", "green", "pink", "blue"];
+
+pub fn is_annotation_color(s: &str) -> bool {
+    ANNOTATION_COLORS.contains(&s)
+}
+
+/// One highlight + optional note. Block offsets are in anchor-text
+/// coordinates (`crate::epub_utils::anchor_text`, which includes the list
+/// bullet prefix), so they map directly to reader hit-testing and painting.
+/// `quote` is the trimmed display text; `prefix`/`suffix` are up to 32 chars
+/// of surrounding anchor text used for fuzzy relocation after re-imports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub id: i64,
+    pub book_id: i64,
+    pub chapter_href: String,
+    pub chapter_index: i64,
+    pub start_block: i64,
+    pub start_offset: i64,
+    pub end_block: i64,
+    pub end_offset: i64,
+    pub color: String,
+    pub note: String,
+    pub quote: String,
+    pub prefix: String,
+    pub suffix: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 pub struct Library {
@@ -178,7 +214,25 @@ impl Library {
                 book_id INTEGER PRIMARY KEY,
                 checked_at INTEGER NOT NULL,
                 remote_chapters INTEGER
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS annotations (
+                id INTEGER PRIMARY KEY,
+                book_id INTEGER NOT NULL,
+                chapter_href TEXT NOT NULL DEFAULT '',
+                chapter_index INTEGER NOT NULL DEFAULT 0,
+                start_block INTEGER NOT NULL DEFAULT 0,
+                start_offset INTEGER NOT NULL DEFAULT 0,
+                end_block INTEGER NOT NULL DEFAULT 0,
+                end_offset INTEGER NOT NULL DEFAULT 0,
+                color TEXT NOT NULL DEFAULT 'yellow',
+                note TEXT NOT NULL DEFAULT '',
+                quote TEXT NOT NULL DEFAULT '',
+                prefix TEXT NOT NULL DEFAULT '',
+                suffix TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_annotations_book ON annotations(book_id);",
         )?;
         // Migration for libraries created before page-level progress existed.
         let has_page: bool = conn
@@ -366,6 +420,7 @@ impl Library {
             let conn = self.connect()?;
             conn.execute("DELETE FROM books WHERE id = ?1", params![id])?;
             conn.execute("DELETE FROM update_checks WHERE book_id = ?1", params![id])?;
+            conn.execute("DELETE FROM annotations WHERE book_id = ?1", params![id])?;
             removed += 1;
         }
         Ok(removed)
@@ -402,6 +457,9 @@ impl Library {
             SortKey::Added => "added_at DESC",
             SortKey::Size => "file_size DESC",
             SortKey::Progress => "progress_chapter DESC, max(added_at, opened_at) DESC",
+            // Session-only update state can't sort in SQL: Recent order here,
+            // then the caller stable-sorts by tier (order within tiers kept).
+            SortKey::NeedsUpdate => "max(added_at, opened_at) DESC",
         };
         let q = query.trim().to_lowercase();
         let sql = format!("SELECT * FROM books ORDER BY {order}");
@@ -524,6 +582,98 @@ impl Library {
         Ok(())
     }
 
+    /// Create a highlight (+ optional note). Block offsets are anchor-text
+    /// char indices; out-of-range values are clamped on resolve, not here.
+    /// Invalid colors fall back to yellow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_annotation(
+        &self,
+        book_id: i64,
+        chapter_href: &str,
+        chapter_index: i64,
+        start_block: i64,
+        start_offset: i64,
+        end_block: i64,
+        end_offset: i64,
+        color: &str,
+        note: &str,
+        quote: &str,
+        prefix: &str,
+        suffix: &str,
+    ) -> AnyhowResult<Annotation> {
+        let color = if is_annotation_color(color) {
+            color.to_string()
+        } else {
+            "yellow".to_string()
+        };
+        let now = Utc::now().timestamp();
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO annotations (book_id, chapter_href, chapter_index, start_block, start_offset, end_block, end_offset, color, note, quote, prefix, suffix, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+            params![
+                book_id,
+                chapter_href,
+                chapter_index,
+                start_block,
+                start_offset,
+                end_block,
+                end_offset,
+                color,
+                note,
+                quote,
+                prefix,
+                suffix,
+                now,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(self.get_annotation(id)?.expect("just inserted annotation"))
+    }
+
+    pub fn get_annotation(&self, id: i64) -> AnyhowResult<Option<Annotation>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT * FROM annotations WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], row_to_annotation)?;
+        if let Some(r) = rows.next() {
+            return Ok(Some(r?));
+        }
+        Ok(None)
+    }
+
+    pub fn list_annotations(&self, book_id: i64) -> AnyhowResult<Vec<Annotation>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM annotations WHERE book_id = ?1 ORDER BY chapter_index, start_block, start_offset, id",
+        )?;
+        let rows = stmt.query_map(params![book_id], row_to_annotation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_annotation(&self, id: i64, color: &str, note: &str) -> AnyhowResult {
+        let color = if is_annotation_color(color) {
+            color
+        } else {
+            "yellow"
+        };
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE annotations SET color=?1, note=?2, updated_at=?3 WHERE id=?4",
+            params![color, note, Utc::now().timestamp(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_annotation(&self, id: i64) -> AnyhowResult {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM annotations WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn get_setting(&self, key: &str) -> AnyhowResult<Option<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
@@ -643,6 +793,26 @@ fn row_to_book(row: &rusqlite::Row) -> rusqlite::Result<Book> {
     })
 }
 
+fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
+    Ok(Annotation {
+        id: row.get("id")?,
+        book_id: row.get("book_id")?,
+        chapter_href: row.get("chapter_href")?,
+        chapter_index: row.get("chapter_index")?,
+        start_block: row.get("start_block")?,
+        start_offset: row.get("start_offset")?,
+        end_block: row.get("end_block")?,
+        end_offset: row.get("end_offset")?,
+        color: row.get("color")?,
+        note: row.get("note")?,
+        quote: row.get("quote")?,
+        prefix: row.get("prefix")?,
+        suffix: row.get("suffix")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
 pub fn sha256_file(path: &Path) -> AnyhowResult<String> {
     let mut f = fs::File::open(path)?;
     let mut h = Sha256::new();
@@ -758,9 +928,7 @@ fn scan_ao3_url(html: &str) -> Option<String> {
 
 /// Scan the opening chapters for an AO3 preface link. Limited to two
 /// chapters: the link lives up front, and later chapters only add cost.
-pub(crate) fn find_ao3_url<R: std::io::Read + std::io::Seek>(
-    doc: &mut EpubDoc<R>,
-) -> Option<String> {
+pub(crate) fn find_ao3_url(doc: &mut EpubDoc) -> Option<String> {
     let n = doc.get_num_chapters();
     for i in 0..n.min(2) {
         if !doc.set_current_chapter(i) {
@@ -980,5 +1148,82 @@ mod tests {
         assert_eq!(lib.get_check(a).unwrap(), None);
         // The other book is untouched.
         assert!(lib.get_by_id(b).unwrap().is_some());
+    }
+
+    #[test]
+    fn annotations_crud_and_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path().join("lib")).unwrap();
+        // Invalid colors fall back to yellow.
+        let a = lib
+            .add_annotation(
+                7,
+                "ch1.xhtml",
+                0,
+                0,
+                1,
+                0,
+                5,
+                "neon",
+                "my note",
+                "quote",
+                "pre",
+                "suf",
+            )
+            .unwrap();
+        assert_eq!(a.color, "yellow");
+        assert_eq!(a.note, "my note");
+        assert!(a.created_at > 0);
+        let got = lib.get_annotation(a.id).unwrap().unwrap();
+        assert_eq!(got.quote, "quote");
+        // List filters by book.
+        assert_eq!(lib.list_annotations(7).unwrap().len(), 1);
+        assert!(lib.list_annotations(8).unwrap().is_empty());
+        // Update color + note; bad color falls back.
+        lib.update_annotation(a.id, "green", "edited").unwrap();
+        let got = lib.get_annotation(a.id).unwrap().unwrap();
+        assert_eq!((got.color.as_str(), got.note.as_str()), ("green", "edited"));
+        lib.update_annotation(a.id, "bogus", "x").unwrap();
+        assert_eq!(lib.get_annotation(a.id).unwrap().unwrap().color, "yellow");
+        // Delete one.
+        lib.delete_annotation(a.id).unwrap();
+        assert!(lib.get_annotation(a.id).unwrap().is_none());
+        assert!(lib.list_annotations(7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_books_cascades_annotations() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path().join("lib")).unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let epub = srcdir.path().join("a.epub");
+        {
+            let file = std::fs::File::create(&epub).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file(
+                "mimetype",
+                opts.compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="ch" href="ch.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="ch"/></spine></package>"#).unwrap();
+            zip.start_file("OEBPS/ch.xhtml", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>Hi.</p></body></html>"#).unwrap();
+            zip.finish().unwrap();
+        }
+        let id = match lib.add_file(&epub).unwrap() {
+            AddOutcome::Added(b) => b.id,
+            AddOutcome::Duplicate(b) => b.id,
+        };
+        lib.add_annotation(id, "ch.xhtml", 0, 0, 0, 0, 2, "pink", "n", "Hi.", "", "")
+            .unwrap();
+        assert_eq!(lib.list_annotations(id).unwrap().len(), 1);
+        assert_eq!(lib.delete_books(&[id]).unwrap(), 1);
+        assert!(lib.list_annotations(id).unwrap().is_empty());
     }
 }

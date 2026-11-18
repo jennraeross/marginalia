@@ -477,3 +477,92 @@ fn backfill_links_untracked_books() {
     // Second pass finds nothing new.
     assert!(lib.backfill_fanfic_urls().expect("backfill").is_empty());
 }
+
+/// EPUB3 nav-only fixture: no NCX, TOC comes from the nav document.
+fn make_epub3_nav(path: &Path) {
+    use std::io::Write;
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file(
+        "mimetype",
+        opts.compression_method(zip::CompressionMethod::Stored),
+    )
+    .unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    zip.start_file("META-INF/container.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+    )
+    .unwrap();
+    let opf = r#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Nav Book</dc:title><dc:creator>Nav Author</dc:creator><dc:language>en</dc:language></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+    zip.start_file("OEBPS/content.opf", opts).unwrap();
+    zip.write_all(opf.as_bytes()).unwrap();
+    zip.start_file("OEBPS/c1.xhtml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><h1>First</h1><p>Body.</p></body></html>"#)
+        .unwrap();
+    zip.start_file("OEBPS/c2.xhtml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Second</h1><p>Body.</p></body></html>"#)
+        .unwrap();
+    zip.start_file("OEBPS/nav.xhtml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="c1.xhtml">First</a></li><li><a href="c2.xhtml#sec">Second</a></li></ol></nav></body></html>"#)
+        .unwrap();
+    zip.finish().unwrap();
+}
+
+#[test]
+fn epub3_nav_toc_without_ncx() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("nav.epub");
+    make_epub3_nav(&p);
+    let (toc, chapters) = epub_utils::load_book(&p).expect("load");
+    assert_eq!(chapters.len(), 2);
+    assert_eq!(toc.len(), 2);
+    assert_eq!(toc[0].chapter, Some(0));
+    assert_eq!(toc[1].chapter, Some(1));
+    assert_eq!(chapters[0].label, "First");
+    assert_eq!(chapters[1].label, "Second");
+}
+
+#[test]
+fn epub3_cover_image_resolves() {
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    use std::io::Write;
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            &vec![180u8; 16 * 16 * 4],
+            16,
+            16,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("cover.epub");
+    {
+        let file = std::fs::File::create(&p).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        let opf = r#"<?xml version="1.0"?><package version="3.0" xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>C</dc:title><dc:creator>A</dc:creator></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="cov" href="cover.png" media-type="image/png" properties="cover-image"/></manifest><spine><itemref idref="c1"/></spine></package>"#;
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        zip.start_file("OEBPS/c1.xhtml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>Hi.</p></body></html>"#).unwrap();
+        zip.start_file("OEBPS/cover.png", opts).unwrap();
+        zip.write_all(&png).unwrap();
+        zip.finish().unwrap();
+    }
+    let mut doc = marginalia::epub_core::EpubDoc::new(&p).expect("open");
+    let (bytes, mime) = doc.get_cover().expect("cover");
+    assert_eq!(bytes, png);
+    assert!(mime.contains("png"));
+}
