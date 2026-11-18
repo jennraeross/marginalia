@@ -41,7 +41,12 @@ jobs:
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
       - name: Package
-        run: cargo packager --release
+        run: |
+          case "${{ runner.os }}" in
+            macOS) cargo packager --release -f dmg ;;
+            Windows) cargo packager --release -f nsis ;;
+            Linux) cargo packager --release -f deb ;;
+          esac
       - name: Upload installers
         uses: softprops/action-gh-release@v2
         with:
