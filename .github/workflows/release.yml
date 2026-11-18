@@ -36,11 +36,15 @@ jobs:
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            libssl-dev
+            libssl-dev \
+            libspeechd-dev \
+            libclang-dev \
+            pkg-config
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
       - name: Package
+        shell: bash
         run: |
           case "${{ runner.os }}" in
             macOS) cargo packager --release -f dmg ;;
